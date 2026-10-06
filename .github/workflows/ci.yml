@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  node-suites:
+    name: Node suites (node ${{ matrix.node }})
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: selfcheck
+        run: node tests/selfcheck.mjs
+      - name: routes
+        run: node tests/routes.mjs
+
+  powershell-suites:
+    name: PowerShell suites (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      # The suites stage a throwaway copy of node.exe under a unique image name,
+      # so no real process can ever be matched. They find node.exe on PATH.
+      - name: supervisor e2e
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/supervisor-e2e.ps1
+      - name: host arm e2e
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/host-arm-e2e.ps1
+      - name: tray selfcheck
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/tray-selfcheck.ps1

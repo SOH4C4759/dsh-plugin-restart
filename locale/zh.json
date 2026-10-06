@@ -1,0 +1,19 @@
+{
+  "meta.title": "一键重启 DSH",
+  "meta.description": "侧边栏底部按钮 + 可选的脱离进程守护：重启整个 DeepSeek Harness 应用与 Host，让刚重建的插件与组合立即生效。",
+  "action.label": "重启 DSH",
+  "action.title": "重启 DSH（应用与 Host）",
+  "dialog.title": "重启 DSH（应用与 Host）",
+  "dialog.lastFailure": "上次重启未完成：{reason}",
+  "action.cancel": "取消",
+  "action.confirm": "立即重启",
+  "action.busy": "正在请求…",
+  "action.armed": "已安排",
+  "action.retry": "重试",
+  "state.armed": "DSH 即将重启，页面会在应用回来后重新连接…",
+  "state.notScheduled": "Host 未安排重启（演练模式或已禁用），应用不会关闭。",
+  "state.hostGone": "无法连接 Host；若应用已退出，请手动重新打开。",
+  "state.failed": "重启请求失败：{reason}",
+  "state.timeout": "请求超时，未确认重启。",
+  "status.failed": "状态请求失败（HTTP {status}）"
+}

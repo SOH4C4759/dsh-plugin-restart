@@ -1,0 +1,71 @@
+{
+  "name": "dsh-plugin-restart",
+  "version": "1.0.0",
+  "description": "One-click DSH restart: a sidebar button plus a detached supervisor that relaunches the DeepSeek Harness desktop app, so a rebuilt plugin or profile change takes effect immediately.",
+  "type": "module",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "locale",
+    "tray",
+    "scripts",
+    "tests",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "meta": {
+    "title": "\u4e00\u952e\u91cd\u542f DSH",
+    "description": "\u4fa7\u8fb9\u680f\u5e95\u90e8\u6309\u94ae + \u53ef\u9009\u7684\u8131\u79bb\u8fdb\u7a0b\u5b88\u62a4\uff1a\u91cd\u542f\u6574\u4e2a DSH \u5e94\u7528\u4e0e Host\uff0c\u8ba9\u521a\u91cd\u5efa\u7684\u63d2\u4ef6/\u7ec4\u5408\u7acb\u5373\u751f\u6548\u3002"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "win32"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "bundle",
+    "cordis",
+    "restart",
+    "relaunch",
+    "electron",
+    "windows",
+    "powershell"
+  ],
+  "author": "林冠宇 (SOH4C4759) <107021339+SOH4C4759@users.noreply.github.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SOH4C4759/dsh-plugin-restart.git"
+  },
+  "homepage": "https://github.com/SOH4C4759/dsh-plugin-restart#readme",
+  "bugs": {
+    "url": "https://github.com/SOH4C4759/dsh-plugin-restart/issues"
+  }
+}

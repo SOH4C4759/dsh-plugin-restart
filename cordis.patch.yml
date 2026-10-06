@@ -1,0 +1,9 @@
+# dsh-plugin-restart bundle patch.
+#
+# One Host row named after the package. The Host half owns the loopback restart
+# route pair (`/api/dsh-restart/status`, `/api/dsh-restart/restart`) and the
+# detached relaunch supervisor; the browser half is declared by
+# `dsh.client` in package.json and registers the sidebar footer button.
+- insert:
+    - id: dsh-plugin-restart
+      name: 'dsh-plugin-restart'

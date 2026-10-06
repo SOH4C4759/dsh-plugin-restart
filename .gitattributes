@@ -1,0 +1,17 @@
+# The package is Windows-only, but it is authored and reviewed on several
+# machines: pin LF everywhere so a Windows checkout with core.autocrlf=true
+# cannot rewrite the PowerShell scripts and produce spurious diffs.
+* text=auto eol=lf
+
+*.ps1 text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.svg text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary

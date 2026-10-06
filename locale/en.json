@@ -1,0 +1,19 @@
+{
+  "meta.title": "One-click DSH restart",
+  "meta.description": "Sidebar-footer button plus an optional detached supervisor: restarts the whole DeepSeek Harness app and Host, so a rebuilt plugin or composition takes effect immediately.",
+  "action.label": "Restart DSH",
+  "action.title": "Restart DSH (app and Host)",
+  "dialog.title": "Restart DSH (app and Host)",
+  "dialog.lastFailure": "Previous restart did not finish: {reason}",
+  "action.cancel": "Cancel",
+  "action.confirm": "Restart now",
+  "action.busy": "Requesting…",
+  "action.armed": "Scheduled",
+  "action.retry": "Retry",
+  "state.armed": "DSH is restarting; this page reconnects once the app is back…",
+  "state.notScheduled": "The Host did not schedule a restart (dry run or disabled), so the app stays open.",
+  "state.hostGone": "Cannot reach the Host; if the app exited, reopen it manually.",
+  "state.failed": "Restart request failed: {reason}",
+  "state.timeout": "The request timed out, so no restart was confirmed.",
+  "status.failed": "Status request failed (HTTP {status})"
+}

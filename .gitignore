@@ -1,0 +1,15 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime state written by the supervisor / tray when they are pointed at an
+# in-repo state directory. The default state directory is
+# <DSH_HOME>/dsh-plugin-restart, which is outside the repository.
+restart-result.json
+restart-request.json
+
+# Scratch directory the plan-contract self-check hands to buildRestartPlan().
+tests/tmp-contract/
+tests/tmp-*/
