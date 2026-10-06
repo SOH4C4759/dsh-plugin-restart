@@ -126,17 +126,125 @@ function Get-AppProcess {
   @(Get-Process -Name $imageName -ErrorAction SilentlyContinue)
 }
 
+<#
+  Parent-process map for this image name, read from the OS.
+
+  Why the stop ORDER needs one: the Electron shell is the parent of the Host and of
+  every renderer, and it owns the Host as a watched child. When the Host dies while
+  the shell is still alive, the shell runs its "desktop host stopped" handler,
+  which is a NATIVE message box — measured on Windows 11 as class #32770, title
+  "DeepSeek Harness unusable", body "the application could not start or has
+  stopped unexpectedly", buttons Quit / Restart / Disable third-party plugins,
+  back up the profile patch and restart — and Windows plays the system
+  notification sound for it (WASAPI system-sounds session, peak 0.13). The shell
+  is then killed a fraction of a second later by the next taskkill, so the user
+  sees exactly one flash of a white dialog plus one ding at the start of the
+  restart.
+
+  Iterating processes in PID order cannot prevent that (PIDs are recycled, so the
+  Host can sort before the shell), and neither can killing the whole set in one
+  pass: the shell only has to outlive the Host by one message-pump turn. The shell
+  is therefore identified by ANCESTRY, terminated on its own, and waited for
+  before anything else is touched.
+#>
+function Get-AppProcessParentMap {
+  $map = @{}
+  try {
+    $query = "SELECT ProcessId, ParentProcessId FROM Win32_Process WHERE Name='{0}.exe'" -f $imageName
+    foreach ($row in @(Get-CimInstance -Query $query -ErrorAction Stop)) {
+      $map[[int]$row.ProcessId] = [int]$row.ParentProcessId
+    }
+  } catch {
+    Write-Log ("parent map unavailable ({0}); falling back to start-time order" -f $_.Exception.Message)
+  }
+  return $map
+}
+
+<#
+  The process every other app process descends from — the Electron shell.
+
+  Falls back to the OLDEST process when ancestry is unavailable, because the shell
+  is always the first process of its own tree. When an orphan of an earlier
+  generation is still around there can be several roots; the shell is the one that
+  is an ancestor of the most processes in this set.
+#>
+function Select-AppRootProcess {
+  param([object[]] $Processes, [hashtable] $ParentMap)
+
+  if ($null -eq $Processes -or $Processes.Count -eq 0) { return $null }
+  $oldest = @{ Expression = { try { $_.StartTime } catch { [datetime]::MaxValue } } }
+  if ($null -eq $ParentMap -or $ParentMap.Count -eq 0) {
+    return ($Processes | Sort-Object -Property $oldest | Select-Object -First 1)
+  }
+  $ids = @{}
+  foreach ($p in $Processes) { $ids[[int]$p.Id] = $true }
+  $roots = @($Processes | Where-Object {
+      $parent = $ParentMap[[int]$_.Id]
+      ($null -eq $parent) -or (-not $ids.ContainsKey([int]$parent))
+    })
+  if ($roots.Count -eq 0) {
+    return ($Processes | Sort-Object -Property $oldest | Select-Object -First 1)
+  }
+  if ($roots.Count -eq 1) { return $roots[0] }
+  $best = $null
+  $bestScore = -1
+  foreach ($root in $roots) {
+    $score = 0
+    foreach ($p in $Processes) {
+      $cursor = [int]$p.Id
+      $hops = 0
+      while ($ParentMap.ContainsKey($cursor) -and $hops -lt 64) {
+        $cursor = [int]$ParentMap[$cursor]
+        if ($cursor -eq [int]$root.Id) { $score++; break }
+        $hops++
+      }
+    }
+    if ($score -gt $bestScore) { $best = $root; $bestScore = $score }
+  }
+  if ($null -eq $best) { return $roots[0] }
+  return $best
+}
+
+function Stop-AppOneProcess {
+  param($Process)
+  try {
+    & taskkill.exe /F /PID $Process.Id 2>&1 | ForEach-Object { if (-not [string]::IsNullOrWhiteSpace($_)) { Write-Log ("  taskkill {0}: {1}" -f $Process.Id, $_) } }
+  } catch {
+    Write-Log ("  taskkill {0} threw: {1}" -f $Process.Id, $_.Exception.Message)
+  }
+}
+
+function Wait-AppProcessGone {
+  param([int] $Id, [int] $TimeoutMs)
+  $waited = 0
+  while ($waited -lt $TimeoutMs) {
+    if ($null -eq (Get-Process -Id $Id -ErrorAction SilentlyContinue)) { return $waited }
+    Start-Sleep -Milliseconds 100
+    $waited += 100
+  }
+  return -1
+}
+
 $before = Get-AppProcess
 Write-Log ("processes before stop = {0} [{1}]" -f $before.Count, (($before | ForEach-Object { $_.Id }) -join ','))
 if ($before.Count -eq 0) {
   Write-Log 'nothing was running; starting one instance'
 } else {
-  foreach ($p in $before) {
-    try {
-      & taskkill.exe /F /PID $p.Id 2>&1 | ForEach-Object { if (-not [string]::IsNullOrWhiteSpace($_)) { Write-Log ("  taskkill {0}: {1}" -f $p.Id, $_) } }
-    } catch {
-      Write-Log ("  taskkill {0} threw: {1}" -f $p.Id, $_.Exception.Message)
+  # The shell goes first, and alone: while it is alive it turns the Host's death
+  # into a native error dialog with a system sound (see Get-AppProcessParentMap).
+  $root = Select-AppRootProcess -Processes $before -ParentMap (Get-AppProcessParentMap)
+  if ($null -ne $root) {
+    Write-Log ("stopping the app root (Electron shell) first: pid={0}" -f $root.Id)
+    Stop-AppOneProcess -Process $root
+    $goneAfterMs = Wait-AppProcessGone -Id $root.Id -TimeoutMs 5000
+    if ($goneAfterMs -ge 0) {
+      Write-Log ("  app root pid={0} is gone after {1}ms; nothing is left that could report the Host as stopped" -f $root.Id, $goneAfterMs)
+    } else {
+      Write-Log ("  app root pid={0} was still alive after 5000ms; stopping the remaining processes anyway" -f $root.Id)
     }
+  }
+  foreach ($p in @($before | Where-Object { $null -eq $root -or $_.Id -ne $root.Id })) {
+    Stop-AppOneProcess -Process $p
   }
 }
 

@@ -18,6 +18,16 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+
+# Capture the helper layer's diagnostics instead of letting them reach the console:
+# the stop ORDER is part of the contract and is asserted below (see
+# Stop-ProcessTree and the shell-first case at the end of this file).
+$script:diag = New-Object System.Collections.Generic.List[string]
+function Write-TrayDiag {
+  param([string] $Message)
+  $script:diag.Add([string]$Message)
+}
+
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'tray\tray-functions.ps1')
 
 $failures = 0
@@ -138,6 +148,26 @@ try {
 
   Assert-Check 'missing executable is reported, not thrown' ((Restart-App -Exe (Join-Path $tempRoot 'nope.exe') -WaitMs 500).phase -eq 'missing-exe') ''
   Assert-Check 'a missing executable stops nothing' (Test-AppRunning -Name $imageName) 'the stand-in from the relaunch step is untouched'
+
+  # --- the app root (Electron shell) is stopped BEFORE its children ---
+  # Measured bug: when the Host dies while the shell is still alive, the shell runs
+  # its "desktop host stopped" handler — a native "DeepSeek Harness unusable"
+  # message box with the Windows system sound — and the shell is killed a moment
+  # later, so the user sees one flash of a white dialog plus one ding at the start
+  # of the restart. A parent stand-in with a child of the same image name
+  # reproduces the shape of the app tree without touching DSH.
+  [void](Stop-ProcessTree -Name $imageName -WaitMs 3000)
+  $script:diag.Clear()
+  $shellScript = "const{spawn}=require('child_process');spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});setInterval(()=>{},1000)"
+  $parent = Start-Process -FilePath $exePath -ArgumentList '-e', $shellScript -PassThru -WindowStyle Hidden
+  $spawned.Add($parent)
+  Start-Sleep -Milliseconds 1500
+  Assert-Check 'the stand-in shell has a child of the same image name' ((Get-AppProcess -Name $imageName).Count -ge 2) ("count=" + (Get-AppProcess -Name $imageName).Count)
+  $stoppedTree = Stop-ProcessTree -Name $imageName -WaitMs 5000
+  $rootLine = $script:diag | Where-Object { $_ -match ("stopping the app root \(Electron shell\) first: pid {0}$" -f $parent.Id) } | Select-Object -First 1
+  Assert-Check 'the tray names the parent shell as the app root and stops it first' ($null -ne $rootLine) (($script:diag | Select-Object -First 3) -join ' | ')
+  Assert-Check 'the tray confirms the shell is gone before the rest are stopped' (($script:diag | Where-Object { $_ -match ("app root pid {0} gone after" -f $parent.Id) }).Count -ge 1) ''
+  Assert-Check 'the whole tree is down after stopping the shell first' ($stoppedTree -eq $true -and -not (Test-AppRunning -Name $imageName)) ''
 } finally {
   Stop-ProcessTree -Name $imageName -WaitMs 3000 | Out-Null
   foreach ($proc in $spawned) { try { if ($null -ne $proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } } catch { } }

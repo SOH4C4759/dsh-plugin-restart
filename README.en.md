@@ -27,7 +27,7 @@ This package **does not patch DSH source and does not need a fork**: it is a sta
 
 | Fact | Consequence |
 |---|---|
-| The desktop Host is a child process of the Electron main process, and the main process treats *any* Host exit as a crash (`dsh desktop host stopped`) | "Restart only the Host" always raises the crash-recovery dialog. That is not one click. |
+| The desktop Host is a child process of the Electron main process, and the main process treats *any* Host exit as a crash (`dsh desktop host stopped`) — it answers with a native "DeepSeek Harness unusable" message box plus the Windows system sound | "Restart only the Host" always raises that dialog. **The stop order matters too**: the Electron main must die first (section 6), or every one-click restart flashes a dialog |
 | The built-in "Restart App and Host" menu item is compiled behind a `development` flag | A release build exposes no restart entry point |
 | A Host process cannot call `app.relaunch()` on its parent, and cannot keep working after it is torn down | You need a **detached supervisor** |
 
@@ -40,7 +40,7 @@ This package **does not patch DSH source and does not need a fork**: it is a sta
 4. **Start a GUI app with `Start-Process` and wait for its window, not just its process.**
    Measured: launched from a hidden console, the process appeared but had **no visible window** — which looks exactly like "the client never came back". The supervisor now polls `MainWindowHandle`: only a window counts as `phase: relaunched`; no window within 20 s is recorded as `relaunched-no-window` (an honest failure, not a fake success).
 
-The supervisor (`lib/restart-supervisor.ps1`) then runs in this order: wait for the trigger → **verify the executable exists first** (never close an app it cannot start again) → list the processes it is about to stop → `taskkill /F` by image name → wait a bounded time until they are gone → start **exactly one** instance → wait for its window → write `restart-result.json` (without a BOM, so Node's `JSON.parse` accepts it).
+The supervisor (`lib/restart-supervisor.ps1`) then runs in this order: wait for the trigger → **verify the executable exists first** (never close an app it cannot start again) → list the processes it is about to stop → **stop the app root (the Electron main) on its own and confirm it is gone** → `taskkill /F` the remaining processes by image name → wait a bounded time until they are gone → start **exactly one** instance → wait for its window → write `restart-result.json` (without a BOM, so Node's `JSON.parse` accepts it).
 
 > About the delay: the gap between the HTTP answer and the supervisor starting (`armDelayMs`) is enforced by the **Host** with a `setTimeout` (see `apply()` in `index.js`) and is not passed to the supervisor — a supervisor that waits an extra second feels like "I clicked and nothing happened". `spawnSupervisor` only passes `-Exe / -GraceMs / -StateDir / -LogPath / -ResultPath`.
 
@@ -59,6 +59,27 @@ Measured on Windows 11 + PowerShell 5.1:
 | `ShowWindow = 0` + `CreateFlags = 0x08000000` | — | no: `Create` returns 21 (invalid parameter) |
 
 So do **not** set `CreateFlags`. Note also that `Invoke-CimMethod -ClassName Win32_Process` cannot marshal the embedded `Win32_ProcessStartup` object ("type mismatch"); the classic `[wmiclass]'Win32_Process'` path is required. `tests/selfcheck.mjs` and `tests/host-arm-e2e.ps1` pin all of this so it cannot regress.
+
+### 6. The Electron main process has to be stopped FIRST, or a Windows dialog flashes on every restart
+
+**Symptom**: a one-click restart briefly flashes a white Windows dialog and plays one system notification sound. A probe (window screenshots + child-control text + per-process WASAPI sound attribution) captured exactly this:
+
+```
+243185 / 243496  taskkill   stopping the app's processes one by one
+243726  NEW-WINDOW  #32770  "DeepSeek Harness unusable"
+243818  CAPTURE     title "DeepSeek Harness unusable", body "the application could not
+                    start or has stopped unexpectedly", buttons Quit / Restart /
+                    Disable third-party plugins, back up the profile patch and restart
+243912  SOUND       pid=0 (Windows system-sounds session) peak=0.1372
+```
+
+**Cause**: the Electron main watches the Host as its own child. The supervisor used to `taskkill` the processes in `Get-Process` order (ascending PID), and **PIDs are recycled — the Host can sort before the main**. In the instant where the Host is dead and the main is still alive, the main runs its "desktop host stopped" handler, raises that native dialog and plays the system sound; the main is then killed by the next `taskkill` in the same loop, so the user only ever sees a flash.
+
+That is also why it was intermittent: on the restarts where the main happened to sort first, nothing appeared.
+
+**Fix**: build a parent map from `Win32_Process.ParentProcessId`, find the **app root** (the ancestor of every other app process — the Electron main), `taskkill /F` it **on its own**, then poll with `Wait-AppProcessGone` until it is really gone before touching anything else. When the parent map is unavailable the code falls back to the oldest process, because the main is always the first process of its own tree. `Stop-ProcessTree` in `tray/tray-functions.ps1` uses the same logic (the tray path has the same trap).
+
+> Why not use the `targetPid` the Host already computes: when process detection fails that pid can be the Host itself, and killing by it first would put the bug back. Ancestry read from the OS is self-consistent and works for both entry points. `tests/supervisor-e2e.ps1` (case 4) and `tests/tray-selfcheck.ps1` both reproduce the shape (a parent with a child of the same image name) and pin the order.
 
 ## Install
 
@@ -179,22 +200,22 @@ Prerequisites: **Windows 10/11 + Windows PowerShell 5.1** (`powershell.exe`; pws
 # Defaults to the local desktop install; on another machine, point $node at your node.exe
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 16 checks
+& $node tests\selfcheck.mjs                                                  # 17 checks
 & $node tests\routes.mjs                                                     # 16 checks
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 13 checks
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 18 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 checks
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 19 checks
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 23 checks
 ```
 
 | Suite | Runtime | Checks | Covers |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 16 | manifest/patch/trust gate/tokenizer/config clamping/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console |
+| `tests/selfcheck.mjs` | Node | 17 | manifest/patch/trust gate/tokenizer/config clamping/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
 | `tests/routes.mjs` | Node | 16 | HTTP route contract (fake ctx + fake req/res, zero side effects) |
-| `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 13 | the supervisor really stops stand-ins, relaunches as-is, writes its result, refuses a missing exe, `-NoRelaunch` |
+| `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | the supervisor really stops stand-ins, relaunches as-is, writes its result, refuses a missing exe, `-NoRelaunch`, **the app root stopped first in a parent/child tree** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | the real `buildRestartPlan` + `spawnSupervisor` path (hidden WMI start, supervisorPid, stand-ins) plus the `detached` negative control |
-| `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 19 | tray process-control layer, trigger-file contract, BOM-less result |
+| `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | tray process-control layer, trigger-file contract, BOM-less result, **the Electron main stopped first** |
 
-**75 checks total**: 32 across the two Node suites plus 43 across the three PowerShell suites.
+**85 checks total**: 33 across the two Node suites plus 52 across the three PowerShell suites.
 
 **Read this before running on another machine or in CI** (environment only, nothing to do with correctness):
 

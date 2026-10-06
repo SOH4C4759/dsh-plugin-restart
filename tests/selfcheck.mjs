@@ -86,6 +86,25 @@ await check('the supervisor guards its own preconditions', () => {
   return `${source.split('\n').length} lines`
 })
 
+await check('the supervisor stops the Electron shell before anything else', () => {
+  // Measured on Windows 11 (probe: screenshots + child-window text + WASAPI
+  // session peaks): when the Host dies while the shell is still alive, the shell
+  // runs its "desktop host stopped" handler — a native #32770 message box titled
+  // "DeepSeek Harness unusable" with Quit / Restart / Disable-third-party-plugins
+  // buttons — and Windows plays the system notification sound. The shell is then
+  // killed by the next taskkill in the same loop, so the user sees one flash of a
+  // white dialog plus one ding at the start of the restart. The stop order must
+  // therefore be explicit: shell first, alone, and confirmed gone.
+  const source = readFileSync(join(packageRoot, 'lib', 'restart-supervisor.ps1'), 'utf8')
+  assert.ok(source.includes('stopping the app root (Electron shell) first'), 'the shell must be named and stopped first')
+  assert.ok(source.includes('Win32_Process'), 'the root must be identified through the OS parent map, not PID order')
+  assert.ok(source.includes('Wait-AppProcessGone'), 'the shell must be confirmed gone before the rest are stopped')
+  assert.ok(/app root pid=\{0\} is gone after \{1\}ms/.test(source), 'the confirmation must be logged')
+  const tray = readFileSync(join(packageRoot, 'tray', 'tray-functions.ps1'), 'utf8')
+  assert.ok(tray.includes('stopping the app root (Electron shell) first'), 'the tray path must stop the shell first too')
+  return 'shell first, then the rest'
+})
+
 await check('command-line tokenizer handles Windows quoting', () => {
   const cases = [
     ['"C:\\Program Files\\App\\app.exe" ', ['C:\\Program Files\\App\\app.exe']],

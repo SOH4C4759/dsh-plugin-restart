@@ -27,7 +27,7 @@
 
 | 事实 | 后果 |
 |---|---|
-| 桌面端 Host 是 Electron 主进程的子进程，主进程把 Host 的退出一律当作崩溃（`dsh desktop host stopped`） | 「只重启 Host」必然弹出崩溃恢复框，不是一键 |
+| 桌面端 Host 是 Electron 主进程的子进程，主进程把 Host 的退出一律当作崩溃（`dsh desktop host stopped`），并弹出原生对话框「DeepSeek Harness 无法使用」+ Windows 系统提示音 | 「只重启 Host」必然弹框；**杀进程的顺序也必须先杀 Electron 主进程**（见第 6 节），否则每次一键重启都会闪一个对话框 |
 | 官方菜单里的「重启应用与 Host」被编译在 `development` 开关后面（正式版构建不暴露） | 界面/菜单没有可用重启入口 |
 | Host 进程无法让父进程 `app.relaunch()`，也无法在自身被拆掉后继续干活 | 需要**脱离进程的守护者** |
 
@@ -40,7 +40,7 @@
 4. **拉起 GUI 应用用 `Start-Process`，并且要等窗口，而不是只等进程。**
    实测：在隐藏控制台里启动应用，进程起来了但**没有可见窗口**——用户看到的就是「客户端没被拉起」。守护脚本现在轮询 `MainWindowHandle`：拿到窗口才算 `phase: relaunched`；20 秒内没窗口则记为 `relaunched-no-window`（诚实反映异常，而不是谎报成功）。
 
-守护脚本（`lib/restart-supervisor.ps1`）的顺序：等待触发 → **先校验 exe 存在**（绝不关闭一个无法重新启动的应用）→ 列出将要终止的进程 → 按镜像名 `taskkill /F` → 有界等待到全部消失 → 启动**恰好一个**实例 → 等窗口 → 写 `restart-result.json`（无 BOM，Node 的 `JSON.parse` 才能读）。
+守护脚本（`lib/restart-supervisor.ps1`）的顺序：等待触发 → **先校验 exe 存在**（绝不关闭一个无法重新启动的应用）→ 列出将要终止的进程 → **先单独终止应用根进程（Electron 主进程）并确认它已消失** → 再按镜像名 `taskkill /F` 处理其余进程 → 有界等待到全部消失 → 启动**恰好一个**实例 → 等窗口 → 写 `restart-result.json`（无 BOM，Node 的 `JSON.parse` 才能读）。
 
 > 关于「等待」：HTTP 应答与守护脚本启动之间的延迟 `armDelayMs` 由 **Host 侧** `setTimeout` 完成（`index.js` 的 `apply()`），不通过命令行传给守护脚本——守护脚本多等一秒就会被用户感知成「点了没反应」。`spawnSupervisor` 只传 `-Exe / -GraceMs / -StateDir / -LogPath / -ResultPath`。
 
@@ -59,6 +59,26 @@ WMI 创建的进程会**分配一个新的控制台**。命令行里的 `-Window
 | `ShowWindow = 0` + `CreateFlags = 0x08000000` | — | 否：`Create` 返回 21（参数错误） |
 
 所以**不要**设 `CreateFlags`。另外 `Invoke-CimMethod -ClassName Win32_Process` 无法封送内嵌的 `Win32_ProcessStartup` 对象（报「类型不匹配」），必须走经典 `[wmiclass]'Win32_Process'` 路径。`tests/selfcheck.mjs` 与 `tests/host-arm-e2e.ps1` 都固化了这几条，防止回退。
+
+### 6. 停止顺序必须先杀 Electron 主进程，否则每次都闪一个 Windows 对话框
+
+**现象**：一键重启时会短暂闪出一个白色 Windows 对话框，同时响一声系统提示音。用探针（窗口截图 + 读子控件文字 + WASAPI 分进程声音归因）抓到的是：
+
+```
+243185 / 243496  taskkill   逐个杀应用进程
+243726  NEW-WINDOW  #32770  «DeepSeek Harness 无法使用»
+243818  CAPTURE     标题「DeepSeek Harness 无法使用」正文「应用无法启动或已意外停止。」
+                    按钮：退出 / 重启 / 禁用第三方插件、备份 profile patch 并重启
+243912  SOUND       pid=0（Windows 系统声音会话）peak=0.1372
+```
+
+**原因**：Electron 主进程把 Host 当作自己的孩子监视。守护脚本原来按 `Get-Process` 的返回顺序（PID 升序）逐个 `taskkill`，而 **PID 会被回收，Host 完全可能排在主进程前面**。Host 先死、主进程还活着的那个瞬间，主进程就走「desktop host stopped」的错误处理，弹出上面这个原生框并播放系统音；紧接着主进程自己也被下一个 `taskkill` 杀掉，所以用户只看到「一闪」。
+
+这也是它偶发的原因：主进程恰好先被杀的那几次重启，什么都不会出现。
+
+**做法**：用 `Win32_Process` 的 `ParentProcessId` 建父子映射，找出**应用根进程**（其余应用进程的祖先，即 Electron 主进程），**单独**先 `taskkill /F`，再用 `Wait-AppProcessGone` 轮询确认它真的消失，之后才动其余进程。父映射拿不到时退化为「最早启动的那个进程」——主进程永远是应用树里最先创建的。`tray/tray-functions.ps1` 的 `Stop-ProcessTree` 走同一套逻辑（托盘路径同样会踩这个坑）。
+
+> 为什么不直接用 Host 传进来的 `targetPid`：进程检测失败时它可能就是 Host 自己，按它先杀等于把 bug 装回去；用 OS 的父子关系判断是自洽的，两条入口都适用。`tests/supervisor-e2e.ps1`（case 4）与 `tests/tray-selfcheck.ps1` 都用「父进程 + 同镜像名子进程」复现了这个树形并锁住顺序。
 
 ## 安装
 
@@ -179,22 +199,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell
 # 默认走本机安装目录；其它机器请把 $node 改成本机 node.exe 路径
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 16 项
+& $node tests\selfcheck.mjs                                                  # 17 项
 & $node tests\routes.mjs                                                     # 16 项
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 13 项
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 18 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 项
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 19 项
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 23 项
 ```
 
 | 套件 | 运行时 | 条数 | 覆盖 |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 16 | manifest/patch/信任门/tokenizer/配置钳制/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏 |
+| `tests/selfcheck.mjs` | Node | 17 | manifest/patch/信任门/tokenizer/配置钳制/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
 | `tests/routes.mjs` | Node | 16 | HTTP 路由契约（假 ctx + 假 req/res，0 副作用） |
-| `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 13 | 守护脚本真杀替身进程、按原样重启、写结果、防误杀守卫、no-launch 开关 |
+| `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | 守护脚本真杀替身进程、按原样重启、写结果、防误杀守卫、no-launch 开关、**父+子树形下的「先杀应用根」顺序** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | Host 真实 `buildRestartPlan` + `spawnSupervisor` 全链路（WMI 隐藏启动、supervisorPid、替身进程）+ `detached` 反例对照 |
-| `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 19 | 托盘进程控制层 + 触发文件契约 + 无 BOM 结果 |
+| `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | 托盘进程控制层 + 触发文件契约 + 无 BOM 结果 + **先杀 Electron 主进程** |
 
-合计 **75 项**断言：2 个 Node 套件共 32 项 + 3 个 PowerShell 套件共 43 项。
+合计 **85 项**断言：2 个 Node 套件共 33 项 + 3 个 PowerShell 套件共 52 项。
 
 **换机器 / 上 CI 前必读**（与代码正确性无关，只与运行环境有关）：
 

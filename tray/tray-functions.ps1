@@ -53,6 +53,85 @@ function Test-AppRunning {
   (Get-AppProcess -Name $Name).Count -gt 0
 }
 
+function Get-ProcessParentMap {
+  <#
+  .SYNOPSIS
+    pid -> parent pid for every process with this image name, read from the OS.
+  .DESCRIPTION
+    The stop ORDER depends on this. The Electron shell is the parent of the Host,
+    and when the Host dies while the shell is alive the shell puts up its native
+    "DeepSeek Harness unusable" message box with the Windows system sound; the
+    shell is then killed a moment later, so the user sees one flash of a white
+    dialog plus one ding. Killing in PID order does not prevent that, so the shell
+    is identified by ancestry and killed first (see Stop-ProcessTree).
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory = $true)][string] $Name)
+
+  $map = @{}
+  if ([string]::IsNullOrWhiteSpace($Name)) { return $map }
+  $escaped = $Name.Trim().Replace("'", "''")
+  try {
+    $query = "SELECT ProcessId, ParentProcessId FROM Win32_Process WHERE Name='{0}.exe'" -f $escaped
+    foreach ($row in @(Get-CimInstance -Query $query -ErrorAction Stop)) {
+      $map[[int]$row.ProcessId] = [int]$row.ParentProcessId
+    }
+  } catch {
+    Write-TrayDiag "parent map unavailable: $($_.Exception.Message)"
+  }
+  return $map
+}
+
+function Select-AppRootProcess {
+  <#
+  .SYNOPSIS
+    The process every other app process descends from — the Electron shell.
+  .DESCRIPTION
+    Falls back to the oldest process when ancestry is unavailable, because the
+    shell is always the first process of its own tree. With an orphan of an earlier
+    generation around there can be several roots; the shell is the one that is an
+    ancestor of the most processes in this set.
+  #>
+  [CmdletBinding()]
+  param(
+    [object[]] $Processes,
+    [hashtable] $ParentMap
+  )
+
+  if ($null -eq $Processes -or $Processes.Count -eq 0) { return $null }
+  $oldest = @{ Expression = { try { $_.StartTime } catch { [datetime]::MaxValue } } }
+  if ($null -eq $ParentMap -or $ParentMap.Count -eq 0) {
+    return ($Processes | Sort-Object -Property $oldest | Select-Object -First 1)
+  }
+  $ids = @{}
+  foreach ($p in $Processes) { $ids[[int]$p.Id] = $true }
+  $roots = @($Processes | Where-Object {
+      $parent = $ParentMap[[int]$_.Id]
+      ($null -eq $parent) -or (-not $ids.ContainsKey([int]$parent))
+    })
+  if ($roots.Count -eq 0) {
+    return ($Processes | Sort-Object -Property $oldest | Select-Object -First 1)
+  }
+  if ($roots.Count -eq 1) { return $roots[0] }
+  $best = $null
+  $bestScore = -1
+  foreach ($root in $roots) {
+    $score = 0
+    foreach ($p in $Processes) {
+      $cursor = [int]$p.Id
+      $hops = 0
+      while ($ParentMap.ContainsKey($cursor) -and $hops -lt 64) {
+        $cursor = [int]$ParentMap[$cursor]
+        if ($cursor -eq [int]$root.Id) { $score++; break }
+        $hops++
+      }
+    }
+    if ($score -gt $bestScore) { $best = $root; $bestScore = $score }
+  }
+  if ($null -eq $best) { return $roots[0] }
+  return $best
+}
+
 function Stop-ProcessTree {
   <#
   .SYNOPSIS
@@ -62,8 +141,11 @@ function Stop-ProcessTree {
     it restarts (launched from a DSH shell), so /T would kill the tray mid-restart
     and leave the app down. Every process of a given image name is already matched
     by name, so /T adds nothing but collateral damage.
-  .OUTPUTS
-    $true when nothing is left alive within the wait budget.
+
+    The shell DOES go first, on its own, and is waited for: while it is alive it
+    reacts to the Host's death with a native error dialog plus the Windows system
+    sound, which the user otherwise sees as a one-frame white popup at the start of
+    every restart (measured; see Select-AppRootProcess).
   #>
   [CmdletBinding()]
   param(
@@ -75,9 +157,24 @@ function Stop-ProcessTree {
 
   if ([string]::IsNullOrWhiteSpace($Name)) { return $true }
   $self = $PID
-  $procs = Get-AppProcess -Name $Name | Where-Object { $_.Id -ne $self -and ($ExcludePid -notcontains $_.Id) }
+  $procs = @(Get-AppProcess -Name $Name | Where-Object { $_.Id -ne $self -and ($ExcludePid -notcontains $_.Id) })
   if (@($procs).Count -eq 0) { return $true }
-  foreach ($proc in $procs) {
+  $root = Select-AppRootProcess -Processes $procs -ParentMap (Get-ProcessParentMap -Name $Name)
+  if ($null -ne $root -and $root.Id -ne $self) {
+    Write-TrayDiag "stopping the app root (Electron shell) first: pid $($root.Id)"
+    try {
+      & taskkill.exe /F /PID $root.Id 2>&1 | Out-Null
+    } catch {
+      Write-TrayDiag "taskkill failed for the app root pid $($root.Id): $($_.Exception.Message)"
+    }
+    $waitedForRoot = 0
+    while ($waitedForRoot -lt 5000 -and $null -ne (Get-Process -Id $root.Id -ErrorAction SilentlyContinue)) {
+      Start-Sleep -Milliseconds 100
+      $waitedForRoot += 100
+    }
+    Write-TrayDiag "app root pid $($root.Id) gone after ${waitedForRoot}ms"
+  }
+  foreach ($proc in @($procs | Where-Object { $null -eq $root -or $_.Id -ne $root.Id })) {
     try {
       & taskkill.exe /F /PID $proc.Id 2>&1 | Out-Null
     } catch {

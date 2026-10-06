@@ -131,6 +131,40 @@ try {
   Assert-Check 'no-relaunch stops the app and starts nothing' ($gone -and $LASTEXITCODE -eq 0) ("exit=" + $LASTEXITCODE + " remaining=" + (Get-StandIn).Count)
   $parsed3 = Get-Content -LiteralPath (Join-Path $caseDir3 'restart-result.json') -Raw | ConvertFrom-Json
   Assert-Check 'no-relaunch writes phase stopped-no-launch' ($parsed3.phase -eq 'stopped-no-launch') ($parsed3 | ConvertTo-Json -Compress)
+
+  # --- case 4: the Electron shell is stopped BEFORE its children ---
+  # Measured bug: when the Host dies while the shell is still alive, the shell runs
+  # its "desktop host stopped" handler — a native #32770 message box, "DeepSeek
+  # Harness unusable / the application could not start or has stopped
+  # unexpectedly", with Quit / Restart / Disable-third-party-plugins buttons — and
+  # Windows plays the system notification sound for it. The shell is killed by the
+  # next taskkill in the same loop, so the user sees one flash of a white dialog
+  # plus one ding at the start of every restart. A parent stand-in with a child of
+  # the same image name reproduces the shape of the app tree without touching DSH.
+  $caseDir4 = Join-Path $tempRoot 'shell-first'
+  New-Item -ItemType Directory -Path $caseDir4 -Force | Out-Null
+  # Space-free and double-quote-free: Start-Process does not quote -ArgumentList
+  # entries, so anything with a space would be split into several argv entries and
+  # the stand-in would die before it ever spawns its child.
+  $shellScript = "const{spawn}=require('child_process');spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});setInterval(()=>{},1000)"
+  $shell = Start-Process -FilePath $exePath -ArgumentList '-e', $shellScript -PassThru -WindowStyle Hidden
+  Start-Sleep -Milliseconds 1500
+  $tree = @(Get-StandIn)
+  Assert-Check 'the stand-in shell has a child of the same image name' ($tree.Count -ge 2) ("count=" + $tree.Count)
+  $childProc = $tree | Where-Object { $_.Id -ne $shell.Id } | Select-Object -First 1
+  $logPath4 = Join-Path $caseDir4 'restart.log'
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $supervisor -Exe $exePath -GraceMs 3000 -StateDir $caseDir4 -LogPath $logPath4 -ResultPath (Join-Path $caseDir4 'restart-result.json') -NoRelaunch | Out-Null
+  $log4 = @(Get-Content -LiteralPath $logPath4 -ErrorAction SilentlyContinue)
+  $rootLine = $log4 | Select-String -SimpleMatch ("stopping the app root (Electron shell) first: pid={0}" -f $shell.Id) | Select-Object -First 1
+  Assert-Check 'the app root is named as the shell and stopped first' ($null -ne $rootLine) ("shellPid=" + $shell.Id)
+  $goneLine = $log4 | Select-String -SimpleMatch ("app root pid={0} is gone after" -f $shell.Id) | Select-Object -First 1
+  Assert-Check 'the shell is confirmed gone before the rest are stopped' ($null -ne $goneLine) ''
+  $childKill = $log4 | Select-String -Pattern 'taskkill (\d+):' | Where-Object { $_.Line -notmatch ("taskkill {0}:" -f $shell.Id) } | Select-Object -First 1
+  Assert-Check 'the remaining processes are stopped after the shell' ($null -ne $childKill -and $null -ne $rootLine -and $childKill.LineNumber -gt $rootLine.LineNumber) ("childKillLine=" + $(if ($null -ne $childKill) { $childKill.LineNumber } else { 'none' }))
+  if ($null -ne $childProc) {
+    Assert-Check 'the child of the shell is gone too' ($null -eq (Get-Process -Id $childProc.Id -ErrorAction SilentlyContinue)) ("childPid=" + $childProc.Id)
+  }
+  foreach ($p in @(Get-StandIn)) { try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { } }
 } finally {
   foreach ($p in @(Get-StandIn)) { try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { } }
   Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
