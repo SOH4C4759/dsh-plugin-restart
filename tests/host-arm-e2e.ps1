@@ -136,6 +136,10 @@ process.exit(0)
   Assert-Check 'cmd /c start also survives a parent exit' (Test-Path -LiteralPath $startMarker) 'marker written'
   $indexSource = Get-Content -LiteralPath (Join-Path $packageRoot 'index.js') -Raw
   Assert-Check 'spawnSupervisor launches through WMI' ($indexSource -match 'Win32_Process') 'index.js must keep the WMI launcher'
+  Assert-Check 'the WMI launcher hides the supervisor console before creation' `
+    (($indexSource -match 'Win32_ProcessStartup') -and ($indexSource -match '\$startup\.ShowWindow = 0') -and ($indexSource -notmatch '\$startup\.CreateFlags')) `
+    'ShowWindow = 0 (SW_HIDE); CreateFlags stalls the created process'
+  Assert-Check 'the arm hop reports the supervisor pid it created' ($parsed.spawned.supervisorPid -gt 0) ("supervisorPid=" + $parsed.spawned.supervisorPid)
 
   # The armed supervisor stops the stand-ins and starts exactly one replacement.
   $deadline = (Get-Date).AddSeconds(30)

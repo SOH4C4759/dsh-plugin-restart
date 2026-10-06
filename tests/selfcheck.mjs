@@ -58,6 +58,22 @@ await check('host half exports the loader contract', () => {
   return `inject=${host.inject.join(',')}`
 })
 
+await check('the WMI launcher hides the supervisor console', () => {
+  // A WMI-created process gets a fresh console, and `-WindowStyle Hidden` is
+  // applied only after PowerShell starts — so the window still flashes. The
+  // startup info has to hide it before the process exists. Measured on Windows
+  // 11 / PowerShell 5.1: ShowWindow = 0 alone works; adding CreateFlags = 1
+  // makes the process start but never run its payload, and Invoke-CimMethod
+  // cannot marshal the embedded object at all.
+  const source = readFileSync(join(packageRoot, 'index.js'), 'utf8')
+  assert.ok(source.includes('Win32_ProcessStartup'), 'startup info must be passed to Win32_Process.Create')
+  assert.ok(source.includes('$startup.ShowWindow = 0'), 'the supervisor console must start hidden (SW_HIDE)')
+  assert.ok(!source.includes('$startup.CreateFlags'), 'CreateFlags stalls the created process; do not set it')
+  assert.ok(!source.includes('Invoke-CimMethod -ClassName Win32_Process'), 'the CIM path cannot marshal Win32_ProcessStartup')
+  assert.ok(source.includes('supervisorPid='), 'the arm hop must report the supervisor pid it created')
+  return 'SW_HIDE before creation'
+})
+
 await check('the supervisor guards its own preconditions', () => {
   const source = readFileSync(join(packageRoot, 'lib', 'restart-supervisor.ps1'), 'utf8')
   // The first supervisor killed the app by PID and then aborted on a name

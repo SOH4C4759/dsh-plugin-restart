@@ -515,26 +515,52 @@ export async function spawnSupervisor(plan, runtime) {
         'param([string] $PayloadPath)',
         '$ErrorActionPreference = "Stop"',
         '$commandLine = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String((Get-Content -LiteralPath $PayloadPath -Raw).Trim()))',
-        '$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine }',
+        // A WMI-created process is given a fresh console, and `-WindowStyle
+        // Hidden` in the command line is applied only after PowerShell has
+        // started — so the supervisor's command-line window was still created
+        // visible and then hidden, i.e. it flashed on screen at the start of
+        // every restart. Setting STARTUPINFO.wShowWindow = SW_HIDE through
+        // Win32_ProcessStartup hides the console before the process exists, so
+        // there is no window to see at all.
+        //
+        // Deliberately NOT setting CreateFlags: measured on Windows 11 with
+        // PowerShell 5.1, `CreateFlags = 1` (STARTF_USESHOWWINDOW) plus
+        // ShowWindow = 0 made the created process start but never execute its
+        // payload, and 0x08000000 was rejected with ReturnValue 21. ShowWindow
+        // alone is what WMI needs here.
+        //
+        // Invoke-CimMethod cannot marshal the embedded Win32_ProcessStartup
+        // object ("type mismatch"), so this uses the classic System.Management
+        // path.
+        "$startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()",
+        '$startup.ShowWindow = 0',
+        "$result = ([wmiclass]'Win32_Process').Create($commandLine, $null, $startup)",
         'if ($result.ReturnValue -ne 0) { Write-Error ("Win32_Process.Create failed with " + $result.ReturnValue); exit 1 }',
+        'Write-Output ("supervisorPid=" + $result.ProcessId)',
         'exit 0',
       ].join('\n'),
       'utf8',
     )
+    let supervisorPid = null
     await new Promise((resolve, reject) => {
       execFile(
         'powershell.exe',
         ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, payloadPath],
         { windowsHide: true },
-        (error) => {
-          if (error !== null) reject(new Error(error.message))
-          else resolve(undefined)
+        (error, stdout) => {
+          if (error !== null) {
+            reject(new Error(error.message))
+            return
+          }
+          const reported = /supervisorPid=(\d+)/.exec(String(stdout ?? ''))
+          supervisorPid = reported === null ? null : Number(reported[1])
+          resolve(undefined)
         },
       )
     })
-    // WMI does not surface the new pid; the supervisor reports its own progress
-    // in restart.log and restart-result.json.
-    return { spawned: true, supervisorPid: null, error: null, via: 'wmi' }
+    // The supervisor reports its own progress in restart.log and
+    // restart-result.json; the pid here is the arming hop's own record.
+    return { spawned: true, supervisorPid, error: null, via: 'wmi' }
   } catch (error) {
     return { spawned: false, supervisorPid: null, error: error instanceof Error ? error.message : String(error) }
   }

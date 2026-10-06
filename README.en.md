@@ -44,6 +44,22 @@ The supervisor (`lib/restart-supervisor.ps1`) then runs in this order: wait for 
 
 > About the delay: the gap between the HTTP answer and the supervisor starting (`armDelayMs`) is enforced by the **Host** with a `setTimeout` (see `apply()` in `index.js`) and is not passed to the supervisor — a supervisor that waits an extra second feels like "I clicked and nothing happened". `spawnSupervisor` only passes `-Exe / -GraceMs / -StateDir / -LogPath / -ResultPath`.
 
+### 5. The supervisor's console must be hidden at creation, not after start
+
+A WMI-created process is given a **fresh console**. `-WindowStyle Hidden` on the command line is applied only *after* PowerShell has started, so the window is created visible and then hidden — that flash is the command-line window a user sees at the start of every restart. The fix is to pass a `Win32_ProcessStartup` object with `ShowWindow = 0` (SW_HIDE) to `Win32_Process.Create`, which hides the console *before the process exists*.
+
+Measured on Windows 11 + PowerShell 5.1:
+
+| Approach | Console visible | Process runs |
+|---|---|---|
+| no startup info | **yes** | yes |
+| command-line `-WindowStyle Hidden` | hidden (but flashes at creation) | yes |
+| **`ShowWindow = 0`** | **hidden, no flash** | yes |
+| `ShowWindow = 0` + `CreateFlags = 1` | — | **no: starts but never executes its payload** |
+| `ShowWindow = 0` + `CreateFlags = 0x08000000` | — | no: `Create` returns 21 (invalid parameter) |
+
+So do **not** set `CreateFlags`. Note also that `Invoke-CimMethod -ClassName Win32_Process` cannot marshal the embedded `Win32_ProcessStartup` object ("type mismatch"); the classic `[wmiclass]'Win32_Process'` path is required. `tests/selfcheck.mjs` and `tests/host-arm-e2e.ps1` pin all of this so it cannot regress.
+
 ## Install
 
 ```powershell
@@ -163,22 +179,22 @@ Prerequisites: **Windows 10/11 + Windows PowerShell 5.1** (`powershell.exe`; pws
 # Defaults to the local desktop install; on another machine, point $node at your node.exe
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 15 checks
+& $node tests\selfcheck.mjs                                                  # 16 checks
 & $node tests\routes.mjs                                                     # 16 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 13 checks
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    #  9 checks
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 19 checks
 ```
 
 | Suite | Runtime | Checks | Covers |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 15 | manifest/patch/trust gate/tokenizer/config clamping/plan contract/client review regressions/style tokens/locale parity/tray structure |
+| `tests/selfcheck.mjs` | Node | 16 | manifest/patch/trust gate/tokenizer/config clamping/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console |
 | `tests/routes.mjs` | Node | 16 | HTTP route contract (fake ctx + fake req/res, zero side effects) |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 13 | the supervisor really stops stand-ins, relaunches as-is, writes its result, refuses a missing exe, `-NoRelaunch` |
-| `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 9 | the real `buildRestartPlan` + `spawnSupervisor` path (WMI, stand-ins) plus the `detached` negative control |
+| `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | the real `buildRestartPlan` + `spawnSupervisor` path (hidden WMI start, supervisorPid, stand-ins) plus the `detached` negative control |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 19 | tray process-control layer, trigger-file contract, BOM-less result |
 
-**72 checks total**: 31 across the two Node suites plus 41 across the three PowerShell suites.
+**75 checks total**: 32 across the two Node suites plus 43 across the three PowerShell suites.
 
 **Read this before running on another machine or in CI** (environment only, nothing to do with correctness):
 

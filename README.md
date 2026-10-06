@@ -44,6 +44,22 @@
 
 > 关于「等待」：HTTP 应答与守护脚本启动之间的延迟 `armDelayMs` 由 **Host 侧** `setTimeout` 完成（`index.js` 的 `apply()`），不通过命令行传给守护脚本——守护脚本多等一秒就会被用户感知成「点了没反应」。`spawnSupervisor` 只传 `-Exe / -GraceMs / -StateDir / -LogPath / -ResultPath`。
 
+### 5. 守护进程的控制台窗口必须在创建时就隐藏
+
+WMI 创建的进程会**分配一个新的控制台**。命令行里的 `-WindowStyle Hidden` 是 PowerShell 启动**之后**才生效的，所以窗口会先以可见状态创建、再被隐藏——用户看到的就是每次重启动一下的命令行窗口。做法是给 `Win32_Process.Create` 传一个 `Win32_ProcessStartup` 并把 `ShowWindow` 设为 `0`（SW_HIDE），让控制台**创建时就是隐藏的**。
+
+实测边界（Windows 11 + PowerShell 5.1）：
+
+| 做法 | 控制台可见 | 进程是否正常执行 |
+|---|---|---|
+| 不传 startup info | **可见** | 是 |
+| 命令行 `-WindowStyle Hidden` | 隐藏（但创建瞬间会闪） | 是 |
+| **`ShowWindow = 0`** | **隐藏，且无闪窗** | 是 |
+| `ShowWindow = 0` + `CreateFlags = 1` | — | **否：进程起来了但从不执行载荷** |
+| `ShowWindow = 0` + `CreateFlags = 0x08000000` | — | 否：`Create` 返回 21（参数错误） |
+
+所以**不要**设 `CreateFlags`。另外 `Invoke-CimMethod -ClassName Win32_Process` 无法封送内嵌的 `Win32_ProcessStartup` 对象（报「类型不匹配」），必须走经典 `[wmiclass]'Win32_Process'` 路径。`tests/selfcheck.mjs` 与 `tests/host-arm-e2e.ps1` 都固化了这几条，防止回退。
+
 ## 安装
 
 ```powershell
@@ -163,22 +179,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell
 # 默认走本机安装目录；其它机器请把 $node 改成本机 node.exe 路径
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 15 项
+& $node tests\selfcheck.mjs                                                  # 16 项
 & $node tests\routes.mjs                                                     # 16 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 13 项
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    #  9 项
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 19 项
 ```
 
 | 套件 | 运行时 | 条数 | 覆盖 |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 15 | manifest/patch/信任门/tokenizer/配置钳制/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构 |
+| `tests/selfcheck.mjs` | Node | 16 | manifest/patch/信任门/tokenizer/配置钳制/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏 |
 | `tests/routes.mjs` | Node | 16 | HTTP 路由契约（假 ctx + 假 req/res，0 副作用） |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 13 | 守护脚本真杀替身进程、按原样重启、写结果、防误杀守卫、no-launch 开关 |
-| `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 9 | Host 真实 `buildRestartPlan` + `spawnSupervisor` 全链路（WMI、替身进程）+ `detached` 反例对照 |
+| `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | Host 真实 `buildRestartPlan` + `spawnSupervisor` 全链路（WMI 隐藏启动、supervisorPid、替身进程）+ `detached` 反例对照 |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 19 | 托盘进程控制层 + 触发文件契约 + 无 BOM 结果 |
 
-合计 **72 项**断言：2 个 Node 套件共 31 项 + 3 个 PowerShell 套件共 41 项。
+合计 **75 项**断言：2 个 Node 套件共 32 项 + 3 个 PowerShell 套件共 43 项。
 
 **换机器 / 上 CI 前必读**（与代码正确性无关，只与运行环境有关）：
 
