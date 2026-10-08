@@ -25,6 +25,8 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: selfcheck
         run: node tests/selfcheck.mjs
+      - name: browser half (stub-React render)
+        run: node tests/ui-render.mjs
       - name: routes
         run: node tests/routes.mjs
 

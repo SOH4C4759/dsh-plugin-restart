@@ -10,9 +10,13 @@
  *     seed word in the client module table.
  *   - The stylesheet is tagged `data-plugin`/`data-plugin-css` so the loader's
  *     claimStyles/removeOwnedStyles cannot take it over or delete it.
- *   - The popover is CSS-anchored inside a `position: relative` wrapper instead of
- *     measuring rects: this slot renders inside a layout-containment box, where
- *     `position: fixed` resolves against that box, not the viewport.
+ *   - The confirmation panel is an inset of the sidebar column, not a floating
+ *     window: it is CSS-anchored to a `position: relative` wrapper (no rect
+ *     maths) and sized from the sidebar's own width, so it reads as part of the
+ *     sidebar instead of a card parked in the bottom-left corner of the window.
+ *     Anchoring it with `position: absolute` also removes the question the
+ *     previous revision could not answer — where `position: fixed` resolves
+ *     inside the shell's layout-containment boxes.
  *   - "Armed" requires `value.scheduled === true`; a dry run answers 200 with
  *     `scheduled: false` and must not be reported as a restart.
  *   - Every request is aborted after a timeout, and a failure stays retryable.
@@ -35,7 +39,10 @@ window.__ModuleLoader__.load({
     const zh = {
       'action.label': '重启 DSH',
       'action.title': '重启 DSH（应用与 Host）',
-      'dialog.title': '重启 DSH（应用与 Host）',
+      'dialog.title': '重启 DSH',
+      // The scope note is an annotation beside the question, never a heading:
+      // it renders at body weight in the tertiary label colour.
+      'dialog.note': '（应用与 Host）',
       'dialog.lastFailure': '上次重启未完成：{reason}',
       'action.cancel': '取消',
       'action.confirm': '立即重启',
@@ -54,7 +61,8 @@ window.__ModuleLoader__.load({
     const en = {
       'action.label': 'Restart DSH',
       'action.title': 'Restart DSH (app and Host)',
-      'dialog.title': 'Restart DSH (app and Host)',
+      'dialog.title': 'Restart DSH',
+      'dialog.note': '(app and Host)',
       'dialog.lastFailure': 'Previous restart did not finish: {reason}',
       'action.cancel': 'Cancel',
       'action.confirm': 'Restart now',
@@ -81,18 +89,32 @@ window.__ModuleLoader__.load({
 .dshr-button:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
 .dshr-button[data-busy="true"] { opacity: .6; cursor: default; }
 .dshr-icon { display: block; width: 16px; height: 16px; flex: none; }
-.dshr-popover {
-  /* The trigger sits at the sidebar foot, so the panel opens from the bottom-left
-     corner and can never hang off the left edge or leave the viewport. */
-  position: fixed; left: 8px; bottom: 8px; z-index: 2147483000;
-  width: 320px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px);
-  overflow: auto; padding: 14px; text-align: left;
-  border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px;
+/* The confirmation is an inset of the sidebar column, not a floating window.
+   It is anchored to the trigger's own wrapper (no rect maths at all), and its
+   width IS the sidebar's content width: the app frame publishes the column
+   width as --dsh-windows-sidebar-width, the sidebar root defines
+   --dsh-sidebar-inline-padding, and both are inherited down to this seat. The
+   trigger registers with order: 10 — below every shipped footer action — so
+   this wrapper is the row's first item and left: 0 lines the panel up with the
+   sidebar's content edge. Nothing here depends on where position: fixed
+   resolves inside the shell's containment boxes. */
+.dshr-panel {
+  position: absolute; left: 0; bottom: calc(100% + 6px); z-index: 2147483000;
+  box-sizing: border-box;
+  width: max(196px, calc(var(--dsh-windows-sidebar-width, 240px) - 2 * var(--dsh-sidebar-inline-padding, 12px)));
+  max-width: calc(100vw - 16px); max-height: calc(100vh - 96px);
+  overflow: auto; padding: 12px; text-align: left;
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: var(--dsw-radius-md, 8px);
   background: var(--dsw-alias-bg-overlay); color: var(--dsw-alias-label-primary);
-  box-shadow: 0 12px 32px rgb(0 0 0 / 24%); font-size: 13px; line-height: 1.55;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 12%); font-size: 13px; line-height: 1.5;
 }
-.dshr-popover:focus { outline: none; }
-.dshr-title { font-weight: 600; margin: 0 0 6px; font-size: 13px; }
+.dshr-panel:focus { outline: none; }
+.dshr-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; margin: 0 0 10px; }
+.dshr-title { font-weight: 600; font-size: 13px; }
+/* The scope note is an annotation, not a heading: body weight, smaller size and
+   the tertiary label colour keep the question the only thing that reads as a
+   title. */
+.dshr-note { font-weight: 400; font-size: 12px; color: var(--dsw-alias-label-tertiary); }
 .dshr-text { margin: 0 0 8px; color: var(--dsw-alias-label-secondary); }
 .dshr-meta { margin: 0 0 4px; color: var(--dsw-alias-label-secondary); font-size: 12px; word-break: break-all; }
 .dshr-warn { margin: 8px 0 0; color: var(--dsw-alias-state-warn-primary); font-size: 12px; }
@@ -203,13 +225,14 @@ window.__ModuleLoader__.load({
     void describeTarget
 
     /**
-     * The header action: a trigger button plus its confirmation popover.
+     * The sidebar-foot action: an icon trigger plus the confirmation panel it
+     * opens directly above itself.
      * @param props - slot props, carrying `t` for the registered namespace.
      */
     function RestartAction(props) {
       const t = typeof props?.t === 'function' ? props.t : (key) => key
       const buttonRef = React.useRef(null)
-      const popoverRef = React.useRef(null)
+      const panelRef = React.useRef(null)
       const [open, setOpen] = React.useState(false)
       const [busy, setBusy] = React.useState(false)
       const [armed, setArmed] = React.useState(false)
@@ -217,7 +240,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState(null)
       const [status, setStatus] = React.useState(null)
 
-      const popoverId = 'dsh-plugin-restart-popover'
+      const panelId = 'dsh-plugin-restart-panel'
 
       const loadStatus = React.useCallback(async () => {
         const result = await postJson(STATUS_URL, {})
@@ -239,7 +262,7 @@ window.__ModuleLoader__.load({
       }, [])
 
       // Escape closes and focus returns to the trigger. No stopPropagation: this
-      // popover is not modal, so it must not swallow Escape from other surfaces.
+      // panel is not modal, so it must not swallow Escape from other surfaces.
       React.useEffect(() => {
         if (!open) return undefined
         const onKeyDown = (event) => {
@@ -256,7 +279,7 @@ window.__ModuleLoader__.load({
       }, [open])
 
       // Outside click closes, but never while a request is in flight: the failure
-      // report would have nowhere to render once the popover is gone.
+      // report would have nowhere to render once the panel is gone.
       React.useEffect(() => {
         if (!open || busy) return undefined
         const onPointerDown = (event) => {
@@ -271,11 +294,11 @@ window.__ModuleLoader__.load({
         }
       }, [open, busy])
 
-      // Move focus into the dialog when it opens, so its buttons are reachable
+      // Move focus into the panel when it opens, so its buttons are reachable
       // without a mouse.
       React.useEffect(() => {
         if (!open) return
-        const node = popoverRef.current
+        const node = panelRef.current
         if (node !== null) node.focus()
       }, [open])
 
@@ -303,27 +326,35 @@ window.__ModuleLoader__.load({
         setError(t('state.failed', { reason: result.payload?.message ?? `HTTP ${String(result.response.status)}` }))
       }, [t])
 
-      const openPopover = React.useCallback(() => {
+      const openPanel = React.useCallback(() => {
         setOpen(true)
         setNotice(null)
         void loadStatus()
       }, [loadStatus])
 
-      const popover = open
+      const panel = open
         ? h(
             'div',
             {
-              className: 'dshr-popover',
-              id: popoverId,
-              ref: popoverRef,
+              className: 'dshr-panel',
+              id: panelId,
+              ref: panelRef,
               tabIndex: -1,
               role: 'dialog',
-              'aria-label': t('dialog.title'),
+              // The accessible name keeps the scope the visible note carries, so
+              // a screen reader hears the full question.
+              'aria-label': t('action.title'),
             },
-            // One line, one question. Target/delay metadata, warnings and the
-            // previous outcome are only shown when they carry information the
-            // user must act on (a failure or a refused request).
-            h('p', { className: 'dshr-title' }, t('dialog.title')),
+            // The question is the heading; the scope note sits beside it as a
+            // muted annotation. Target/delay metadata, warnings and the previous
+            // outcome are only shown when they carry information the user must
+            // act on (a failure or a refused request).
+            h(
+              'p',
+              { className: 'dshr-head' },
+              h('span', { className: 'dshr-title' }, t('dialog.title')),
+              h('span', { className: 'dshr-note' }, t('dialog.note')),
+            ),
             error !== null ? h('p', { className: 'dshr-error', role: 'alert' }, error) : null,
             notice !== null ? h('p', { className: 'dshr-warn', role: 'status' }, notice) : null,
             status?.lastResult?.ok === false && typeof status.lastResult.reason === 'string'
@@ -365,12 +396,12 @@ window.__ModuleLoader__.load({
             title: t('action.title'),
             'aria-label': t('action.title'),
             'aria-haspopup': 'dialog',
-            'aria-controls': open ? popoverId : undefined,
+            'aria-controls': open ? panelId : undefined,
             'aria-expanded': open,
             'data-busy': busy ? 'true' : 'false',
             onClick: () => {
               if (open) close()
-              else openPopover()
+              else openPanel()
             },
           },
           h(RestartGlyph, null),
@@ -378,7 +409,7 @@ window.__ModuleLoader__.load({
           // never renders a text label — its name lives in the tooltip and the
           // accessible label.
         ),
-        popover,
+        panel,
         armed ? h('div', { className: 'dshr-overlay', role: 'status' }, t('state.armed')) : null,
       )
     }

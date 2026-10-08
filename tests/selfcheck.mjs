@@ -206,8 +206,16 @@ await check('client half keeps the review fixes', () => {
   // F4: a hung request must not freeze the popover forever.
   assert.ok(source.includes('AbortController'), 'requests need an abort signal')
   assert.ok(source.includes('aborted'), 'an abort must be distinguished from a failure')
-  // F5/F10: viewport-anchored corner panel, not rect maths inside a containment box.
-  assert.ok(source.includes('position: fixed; left: 8px; bottom: 8px'), 'the popover must be anchored to the bottom-left corner')
+  // F5/F10 (revised 2026-10-08): the confirmation is an inset of the sidebar
+  // column, not a card in the bottom-left corner of the viewport. It is anchored
+  // to the trigger's own wrapper and sized from the sidebar's own width, so the
+  // "no rect maths" rule still holds — and the panel no longer depends on which
+  // box `position: fixed` resolves against inside the shell's containment boxes.
+  assert.ok(source.includes('position: absolute; left: 0; bottom: calc(100% + 6px)'),
+    'the confirmation must be anchored to the trigger, above it, inside the sidebar')
+  assert.ok(!source.includes('position: fixed; left: 8px'), 'the viewport-corner window must be gone')
+  assert.ok(source.includes('var(--dsh-windows-sidebar-width'), 'the width must come from the frame\'s sidebar column')
+  assert.ok(source.includes('var(--dsh-sidebar-inline-padding'), 'the width must respect the sidebar inline padding')
   assert.ok(!source.includes('getBoundingClientRect'), 'no rect maths may remain')
   // F6: Escape must not be swallowed for the whole document.
   assert.ok(!/\.stopPropagation\s*\(/.test(source), 'the popover must not hijack document keys')
@@ -229,6 +237,21 @@ await check('client half keeps the review fixes', () => {
   assert.ok(source.includes('locale: NAMESPACE'), 'the slot entry must declare its locale namespace')
   assert.ok(/ctx\.locale\.bind\(/.test(source), 'translation must go through the locale service')
   return 'data-plugin, scheduled===true, abort, CSS anchor, no stopPropagation, busy guard, a11y, locale'
+})
+
+await check('the confirmation keeps the scope note out of the title', () => {
+  // The question is "重启 DSH"; "（应用与 Host）" is a scope annotation. It must
+  // not be a second bold heading: separate dictionary entry, own span, body
+  // weight, tertiary label colour. tests/ui-render.mjs proves the same thing by
+  // really rendering the panel.
+  const source = readFileSync(join(packageRoot, 'client.js'), 'utf8')
+  assert.ok(source.includes("'dialog.note'"), 'the scope note needs its own dictionary entry')
+  assert.ok(/h\('span', \{ className: 'dshr-title' \}/.test(source), 'the question is a title span')
+  assert.ok(/h\('span', \{ className: 'dshr-note' \}/.test(source), 'the note is its own span, not part of the title')
+  assert.ok(/\.dshr-note \{[^}]*font-weight: 400/.test(source), 'the note must not be bold')
+  assert.ok(/\.dshr-note \{[^}]*var\(--dsw-alias-label-tertiary\)/.test(source), 'the note must be visually weaker')
+  assert.equal(/'dialog\.title': '([^']+)'/.exec(source)?.[1], '重启 DSH', 'the title must be the question alone')
+  return 'title + muted note'
 })
 
 await check('styles use theme tokens only', () => {

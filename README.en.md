@@ -7,7 +7,7 @@
 
 After you rebuild a plugin, **click the "Restart DSH" button in the UI** and the entire DeepSeek Harness desktop app (Electron shell + Host) exits and relaunches itself, so the freshly built plugin, bundle, or preset is loaded immediately.
 
-- An **icon-only button at the sidebar foot** (`sidebar.footer.action`, `order: 10`), next to the account launcher. Hovering shows a tooltip; clicking opens a one-question confirmation panel (title + Cancel / Restart now).
+- An **icon-only button at the sidebar foot** (`sidebar.footer.action`, `order: 10`), next to the account launcher. Hovering shows a tooltip; clicking opens a confirmation panel **inside the sidebar column** (not in the corner of the window): the question `Restart DSH`, a de-emphasised scope note `(app and Host)`, and Cancel / Restart now.
 - Optional: `tray/tray-host.ps1` puts "Restart DSH" in the Windows notification area, so a restart does not depend on the UI being reachable.
 
 This package **does not patch DSH source and does not need a fork**: it is a standard profile bundle (`dsh.bundle.patch` + `dsh.client`) that you install into your own profile.
@@ -200,7 +200,9 @@ Prerequisites: **Windows 10/11 + Windows PowerShell 5.1** (`powershell.exe`; pws
 # Defaults to the local desktop install; on another machine, point $node at your node.exe
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 17 checks
+& $node tests\selfcheck.mjs                                                  # 18 checks
+& $node tests\ui-render.mjs                                                  # 24 checks (stub-React render of the browser half)
+& $node tests\ui-render.mjs --bundle <old client.js> --control               # negative control: the old bundle must fail
 & $node tests\routes.mjs                                                     # 16 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 18 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 checks
@@ -209,13 +211,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 | Suite | Runtime | Checks | Covers |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 17 | manifest/patch/trust gate/tokenizer/config clamping/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
+| `tests/selfcheck.mjs` | Node | 18 | manifest/patch/trust gate/tokenizer/config clamping/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
+| `tests/ui-render.mjs` | Node (`node:vm`) | 24 | the browser half **really rendered**: seat plus id/order, icon-only trigger, the sidebar-inset confirmation after a press, title and muted note as separate elements, panel width from the sidebar column variables, no rect maths (`--control` gives the negative control) |
 | `tests/routes.mjs` | Node | 16 | HTTP route contract (fake ctx + fake req/res, zero side effects) |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | the supervisor really stops stand-ins, relaunches as-is, writes its result, refuses a missing exe, `-NoRelaunch`, **the app root stopped first in a parent/child tree** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | the real `buildRestartPlan` + `spawnSupervisor` path (hidden WMI start, supervisorPid, stand-ins) plus the `detached` negative control |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | tray process-control layer, trigger-file contract, BOM-less result, **the Electron main stopped first** |
 
-**85 checks total**: 33 across the two Node suites plus 52 across the three PowerShell suites.
+**110 checks total**: 58 across the three Node suites plus 52 across the three PowerShell suites.
 
 **Read this before running on another machine or in CI** (environment only, nothing to do with correctness):
 
@@ -227,7 +230,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 `routes.mjs` captures the two really-registered routes from a fake Host context and drives them with fake `req`/`res` objects. It covers the loopback/same-origin guard (403), the method guard (405), `enabled:false` (409), `dryRun` (200 + plan), arming (202), and a malformed body. The arming hop is replaced by a stub through the test-only `DSH_RESTART_NO_ARM=1`, so **no supervisor is ever launched and nothing is written to the real state directory**.
 
-`selfcheck.mjs` contains a **client review-regression block** that turns every finding from two rounds of review into an assertion (styles must carry `data-plugin`, arming must require `scheduled === true`, a failure must not arm, requests must be abortable, the panel must be CSS-anchored rather than rect-measured, no `stopPropagation`, an outside click must not dismiss a busy panel, a11y and locale wiring), so none of them can regress silently.
+`selfcheck.mjs` contains a **client review-regression block** that turns every finding from two rounds of review into an assertion (styles must carry `data-plugin`, arming must require `scheduled === true`, a failure must not arm, requests must be abortable, the panel must be CSS-anchored rather than rect-measured, no `stopPropagation`, an outside click must not dismiss a busy panel, a11y and locale wiring), so none of them can regress silently. The "CSS-anchored" assertion was **restated on 2026-10-08**: the confirmation moved from a floating card in the bottom-left corner of the viewport to an inset of the sidebar column, so the assertion now reads "anchored to the trigger's own wrapper, width taken from the sidebar column variables, still no rect maths".
+
+`ui-render.mjs` is the **behavioural** half of the same conclusions: it loads `client.js` into `node:vm` (stub React plus stub `slots`/`locale`), really renders the component registered into `sidebar.footer.action` — first closed (icon only, no text, full accessible name), then again after calling the trigger's `onClick` — and then asserts that the panel is the plugin's own seat, that the question and the scope note are two different elements, that the note is neither the title nor bold, and that the width comes from `--dsh-windows-sidebar-width` and `--dsh-sidebar-inline-padding`. `--bundle <old> --control` expects the old bundle to fail **exactly** the new expectations (10 of them, measured): otherwise the suite has gone blind.
 
 The most valuable single check is the **plan contract**: it parses the `param()` block of `lib/restart-supervisor.ps1` for the parameters the script really declares, then asserts that `buildRestartPlan()` produces them and that `spawnSupervisor` passes `-Exe/-GraceMs/-StateDir/-LogPath/-ResultPath` through as argv. That catches "one side writes `targetPid`, the other reads `parentPid`" at development time instead of at the moment of a restart — which is exactly where this package's first version failed.
 
@@ -244,6 +249,8 @@ After one app restart you can also ask the **running Host** what it resolved, us
 - **A real restart cannot be self-tested by an agent** (the restart kills the process running the tests). The repository therefore ships non-destructive verification only: route contract, dry-run plan, trust gate, script syntax, client registration.
 - `dsh.client.inject` declares `@deepseek-ai/dsh-client-ui-conversation` to ensure the UI package that provides the sidebar-footer slot loads before this plugin; `client.js` itself only requires `react`.
 - The UI styles depend on DSH's internal design tokens (`--dsw-alias-*`) so they follow the host theme. Those names are an internal host contract and may be renamed across major versions.
+- The confirmation panel's **width** comes from the host's sidebar column variable `--dsh-windows-sidebar-width` (published by the frame on the grid column) and `--dsh-sidebar-inline-padding` (defined by the sidebar root), both with fallbacks (`240px` / `12px`): when neither resolves the panel degrades to 216px rather than collapsing to zero. Those two names are host-internal contracts, exactly like `--dsw-alias-*`.
+- Horizontal alignment relies on the plugin's `order: 10` being the lowest in the footer action row: it registers first in `footerActions`, so `left: 0` equals the sidebar's content edge. If another plugin ever takes a smaller `order`, the panel merely shifts right by that button's width — it never leaves the sidebar.
 - The generated client bundle is unminified; this is a development/personal-use package.
 - Force-killing the process tree interrupts running tasks; session logs are persisted per event, so a normal restart can still `--resume`.
 - If the button disappears after a DSH upgrade, run `install_bundle` once more.

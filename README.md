@@ -7,7 +7,7 @@
 
 插件迭代后，**点一下界面上的「重启 DSH」按钮**，整个 DeepSeek Harness 桌面应用（Electron 外壳 + Host）会退出并自动重新启动，让刚重建的插件包、组合（bundle）、preset 立即生效。
 
-- **左下角头像/设置那一排**的图标按钮（`sidebar.footer.action`，`order: 10`）：纯图标、无文字，悬停有提示，点击后一个**极简确认框**（一句标题 + 取消/立即重启）。
+- **左下角头像/设置那一排**的图标按钮（`sidebar.footer.action`，`order: 10`）：纯图标、无文字，悬停有提示，点击后在**侧栏内**（不是窗口角落）弹出确认面板——一句标题 `重启 DSH`、一条弱化的范围备注 `（应用与 Host）`，加 取消 / 立即重启。
 - 可选：`tray/tray-host.ps1` 提供 Windows 托盘入口「重启 DSH」，不依赖界面也能重启/拉起。
 
 本包**不修改 DSH 源码、不需要 fork**：它是一个标准 profile bundle（`dsh.bundle.patch` + `dsh.client`），装进当前 profile 即可。
@@ -199,7 +199,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell
 # 默认走本机安装目录；其它机器请把 $node 改成本机 node.exe 路径
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 17 项
+& $node tests\selfcheck.mjs                                                  # 18 项
+& $node tests\ui-render.mjs                                                  # 24 项（桩 React 真渲染浏览器半）
+& $node tests\ui-render.mjs --bundle <旧版 client.js> --control              # 反向对照：旧版必须失败
 & $node tests\routes.mjs                                                     # 16 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 18 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 项
@@ -208,13 +210,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 | 套件 | 运行时 | 条数 | 覆盖 |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 17 | manifest/patch/信任门/tokenizer/配置钳制/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
+| `tests/selfcheck.mjs` | Node | 18 | manifest/patch/信任门/tokenizer/配置钳制/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
+| `tests/ui-render.mjs` | Node (`node:vm`) | 24 | 浏览器半**真渲染**：席位与 id/order、纯图标触发、按下后侧栏内嵌面板、标题与弱化备注分离、面板宽度取自侧栏列变量、无 rect 计算（配 `--control` 反向对照） |
 | `tests/routes.mjs` | Node | 16 | HTTP 路由契约（假 ctx + 假 req/res，0 副作用） |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | 守护脚本真杀替身进程、按原样重启、写结果、防误杀守卫、no-launch 开关、**父+子树形下的「先杀应用根」顺序** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | Host 真实 `buildRestartPlan` + `spawnSupervisor` 全链路（WMI 隐藏启动、supervisorPid、替身进程）+ `detached` 反例对照 |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | 托盘进程控制层 + 触发文件契约 + 无 BOM 结果 + **先杀 Electron 主进程** |
 
-合计 **85 项**断言：2 个 Node 套件共 33 项 + 3 个 PowerShell 套件共 52 项。
+合计 **110 项**断言：3 个 Node 套件共 58 项 + 3 个 PowerShell 套件共 52 项。
 
 **换机器 / 上 CI 前必读**（与代码正确性无关，只与运行环境有关）：
 
@@ -226,7 +229,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 `routes.mjs` 用假 Host 上下文捕获真实注册的两个路由，再用假 `req/res` 驱动它们，覆盖：loopback/同源守卫（403）、方法守卫（405）、`enabled:false`（409）、`dryRun`（200 + 计划）、武装（202）与畸形 body 兜底；武装那一跳由测试专用开关 `DSH_RESTART_NO_ARM=1` 换成桩，**不会启动任何守护进程、也不会写出到真实状态目录**。
 
-`selfcheck.mjs` 里有一条**客户端审查结论回归**：把两轮代码审查发现的每一条（样式必须带 `data-plugin`、武装必须要求 `scheduled === true`、失败不得置 armed、请求必须可中止、弹层必须 CSS 锚定而非 rect 计算、不得 `stopPropagation`、busy 期间不得被外部点击关掉、a11y 与 locale 接线）固化成断言，防止回退。
+`selfcheck.mjs` 里有一条**客户端审查结论回归**：把两轮代码审查发现的每一条（样式必须带 `data-plugin`、武装必须要求 `scheduled === true`、失败不得置 armed、请求必须可中止、弹层必须 CSS 锚定而非 rect 计算、不得 `stopPropagation`、busy 期间不得被外部点击关掉、a11y 与 locale 接线）固化成断言，防止回退。其中「弹层必须 CSS 锚定」一条在 2026-10-08 被**改写成新结论**：确认面板从「视口左下角的浮窗」改为「侧栏列内嵌面板」，断言随之变为「锚定在触发按钮自己的 wrapper 上、宽度取自侧栏列变量、且仍然不做 rect 计算」。
+
+`ui-render.mjs` 是同一批结论的**行为版**：它把 `client.js` 装进 `node:vm`（桩 React + 桩 `slots`/`locale`），真的把注册进 `sidebar.footer.action` 的组件渲染出来——先渲染闭合态（纯图标、无文字、`aria-label` 完整），再调用触发按钮的 `onClick` 渲染展开态，然后断言面板落在自己的席位上、标题与备注是两个不同元素、备注不是标题也不是粗体、面板宽度来自 `--dsh-windows-sidebar-width` 与 `--dsh-sidebar-inline-padding`。它支持 `--bundle <旧版> --control`：旧 bundle 上必须**恰好**在新期望上失败（实测 10 项），否则说明这套断言恒真、已经失去鉴别力。
 
 其中最有价值的一项是**计划契约自检**：它解析 `lib/restart-supervisor.ps1` 的 `param()` 块里脚本真正声明的参数，再断言 `buildRestartPlan()` 都产出、且 `spawnSupervisor` 会把 `-Exe/-GraceMs/-StateDir/-LogPath/-ResultPath` 逐个作为 argv 传下去——开发期就挡住「一边写 `targetPid`、另一边读 `parentPid`」这类只在重启瞬间才炸的字段漂移（本包第一版正是栽在这里）。
 
@@ -243,6 +248,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 - **真实重启不可由代理自测**（重启会杀掉执行测试的进程）。因此仓库内只做非破坏性验证：路由契约、dry-run 计划、信任门、脚本语法、客户端注册。
 - `dsh.client.inject` 声明了 `@deepseek-ai/dsh-client-ui-conversation`，用于保证侧边栏页脚插槽所在的 UI 包先于本插件加载；`client.js` 本身只 `require('react')`。
 - 界面样式依赖 DSH 内部设计 token（`--dsw-alias-*`），因此跟随宿主主题；这些名字属于宿主内部契约，跨大版本可能改名。
+- 确认面板的**宽度**取自宿主的侧栏列变量 `--dsh-windows-sidebar-width`（由框架在网格列上发布）与侧栏根定义的 `--dsh-sidebar-inline-padding`，两者都带兜底值（`240px` / `12px`）：变量缺失时面板退化为 216px 宽，不会塌成 0。这两个名字与 `--dsw-alias-*` 同属宿主内部契约，改名时同样只需跟随调整。
+- 面板横向对齐依赖「本插件的 `order: 10` 是页脚动作排里最小的一个」——它注册在 `footerActions` 这一整行 flex 的首位，因此 `left: 0` 就等于侧栏内容列的左缘。若将来有别的插件用更小的 `order` 挤到前面，面板只会整体右移该按钮的宽度，不会错位到侧栏之外。
 - 生成的客户端 bundle 未压缩，仅为本机开发/自用。
 - 强制终止进程树会打断正在运行的任务；会话日志按事件持久化，正常重启后仍可 `--resume`。
 - 升级 DSH 后若按钮消失，重新 `install_bundle` 一次即可。
