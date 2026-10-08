@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-restart",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "One-click DSH restart: a sidebar button plus a detached supervisor that relaunches the DeepSeek Harness desktop app, so a rebuilt plugin or profile change takes effect immediately.",
   "type": "module",
   "icon": "./icon.svg",
