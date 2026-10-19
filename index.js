@@ -230,14 +230,15 @@ export function normalizePosition(value, fallback = DEFAULT_POSITION) {
 const PENDING_MERGE_MS = 4000
 
 /**
- * How long after this Host starts a config reconcile is treated as startup noise
- * rather than a change the user just made.
+ * How long a settled plugin/profile change is given before the watcher re-reads
+ * which Host modules this generation holds.
  *
- * `app-boot/config-reload` also fires while the profile is being reconciled at
- * boot, and a prompt that appears the moment the app opens — for a change that
- * was already applied by the launch itself — is a defect, not a feature.
+ * The manager settles the Loader tree live and then announces it; re-binding
+ * immediately would race the file writes an install is still finishing, so the
+ * baseline is taken once the change has come to rest. Re-binding is the whole
+ * reaction: a settled change never raises the prompt by itself.
  */
-const BOOT_QUIET_MS = 4000
+const MODULE_RESETTLE_MS = 1500
 
 /** Absolute path of the user-facing UI preferences this plugin owns. */
 export function resolveUiSettingsPath(stateDir) {
@@ -1069,10 +1070,10 @@ function applyHost(ctx, rawConfig) {
   const supervisor = resolveSupervisorScript(config.supervisorPath, loaderPackageDir)
   /** Armed restart timers, so a teardown cancels a restart that has not fired. */
   const pending = new Set()
-  /** This Host generation's start, used to tell a startup reconcile from a change. */
-  const bootAt = Date.now()
   /** Host entry modules stamped by the rebuild watcher (empty when disabled). */
   let watchedModules = []
+  /** Their stamps at the last bind; `takeModuleChange` advances it. */
+  let moduleBaseline = new Map()
 
   // A marker written by a process that no longer exists has already been
   // honoured by the launch that replaced it. A marker written by THIS process
@@ -1284,13 +1285,20 @@ function applyHost(ctx, rawConfig) {
   }
 
   /**
-   * Listen for the two signals that mean "the plugin/profile set changed".
+   * Listen for the signals that the plugin/profile set changed — and use them to
+   * RE-READ what is loaded, never to raise the prompt.
    *
-   * `plugin-manager/changed` is a manager operation that completed in THIS
-   * process (the Plugins page, a bundled activation). `app-boot/config-reload`
-   * is the patch generation a CLI or a hand edit produced, reconciled by the
-   * watcher — which announces nothing on the manager event. Both are recorded,
-   * and neither is reported as "applied": a restart is what applies them.
+   * Why not prompt: DSH applies these changes live. `plugin-manager/changed` is a
+   * manager operation that completed in this process, and `app-boot/config-reload`
+   * literally means "profile patches were reconciled into the running Loader tree:
+   * every entry update settled". A fresh install, a toggle, or a patch edit is
+   * already in effect when the event arrives; asking for a restart afterwards is
+   * the false prompt this card must never show.
+   *
+   * What a restart CAN change — and the only thing that raises the prompt — is a
+   * Host entry module whose bytes moved after this generation loaded it. These
+   * listeners exist to keep that comparison honest: a new install adds modules
+   * that were never stamped, so the baseline is re-read once the change settled.
    */
   const listeners = []
   const listen = (event, handler) => {
@@ -1300,7 +1308,7 @@ function applyHost(ctx, rawConfig) {
         try {
           handler(payload)
         } catch (error) {
-          ctx.logger?.warn?.('dsh-plugin-restart: pending marker failed (%s)', error instanceof Error ? error.message : String(error))
+          ctx.logger?.warn?.('dsh-plugin-restart: change handling failed (%s)', error instanceof Error ? error.message : String(error))
         }
       })
       if (typeof off === 'function') listeners.push(off)
@@ -1308,65 +1316,110 @@ function applyHost(ctx, rawConfig) {
       /* an event this Host does not publish is not an error */
     }
   }
+  /** Pending re-bind, so a burst of events settles into one pass. */
+  let resettleTimer = null
+
+  /**
+   * Report one moved stamp for a module this generation already loaded.
+   *
+   * Only modules that were in the baseline can be reported: a file that appeared
+   * after the boot (a fresh install) has nothing to compare against and therefore
+   * nothing a restart could change. Returns the file that moved, or null.
+   */
+  function reportMovedModule() {
+    try {
+      const changed = takeModuleChange(moduleBaseline)
+      if (changed === null) return null
+      recordPending(config.stateDir, { source: 'module-watch', reason: 'host-module' })
+      ctx.logger?.info?.('dsh-plugin-restart: Host module changed (%s); restart pending', changed)
+      return changed
+    } catch (error) {
+      ctx.logger?.warn?.('dsh-plugin-restart: module watch failed (%s)', error instanceof Error ? error.message : String(error))
+      return null
+    }
+  }
+
+  const resettle = () => {
+    if (resettleTimer !== null) clearTimeout(resettleTimer)
+    resettleTimer = setTimeout(() => {
+      resettleTimer = null
+      // An UPGRADE of an already-loaded plugin can land here: it rewrites the
+      // entry module this process booted with, so it still needs a restart. Check
+      // the stamps BEFORE re-binding — that is the difference between "upgraded"
+      // and "newly installed".
+      reportMovedModule()
+      rebindWatchedModules()
+    }, MODULE_RESETTLE_MS)
+    if (typeof resettleTimer.unref === 'function') resettleTimer.unref()
+  }
+
+  /**
+   * Re-read the watched module set and take a fresh stamp baseline.
+   *
+   * Called at mount and after every settled change. A failed read disables the
+   * watcher for this generation instead of throwing: the watcher is a bonus
+   * signal, and a restart button that cannot be mounted is worse than one that
+   * never prompts.
+   */
+  function rebindWatchedModules() {
+    try {
+      const fromLoader = collectHostModules(ctx)
+      // The Loader does not always publish entry filenames (measured: it does not
+      // on 0.2.0-rc.2/0.2.1-rc.2), so the profile's linked dependencies are the
+      // fallback.
+      const fromProfile = collectLinkedModules(readProfileDir(ctx))
+      watchedModules = [...new Set([...fromLoader, ...fromProfile])]
+      moduleBaseline = snapshotModuleStamps(watchedModules)
+    } catch (error) {
+      watchedModules = []
+      moduleBaseline = new Map()
+      ctx.logger?.warn?.('dsh-plugin-restart: module watch disabled (%s)', error instanceof Error ? error.message : String(error))
+    }
+  }
+
   if (config.prompt) {
-    listen('plugin-manager/changed', (change) => {
-      recordPending(config.stateDir, { source: 'plugin-manager', reason: change?.reason ?? 'plugin' })
-    })
+    listen('plugin-manager/changed', resettle)
     listen('plugin-manager/install-state', (progress) => {
-      if (progress?.phase === 'applying') recordPending(config.stateDir, { source: 'install', reason: 'install' })
+      // `applying` is the phase where the files are in place; the earlier phases
+      // describe a download, not a change that could need a restart.
+      if (progress?.phase === 'applying') resettle()
     })
-    listen('app-boot/config-reload', () => {
-      // The startup reconcile runs once the Loader tree is up and is not a user
-      // change; only a reload after the quiet window is.
-      if (Date.now() - bootAt < BOOT_QUIET_MS) return
-      recordPending(config.stateDir, { source: 'config-reload', reason: 'config-reload' })
-    })
+    listen('app-boot/config-reload', resettle)
   }
   for (const off of listeners) {
     if (typeof ctx.effect === 'function') ctx.effect(() => off, 'dsh-plugin-restart: change listener')
   }
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => {
+      if (resettleTimer !== null) clearTimeout(resettleTimer)
+      resettleTimer = null
+    }, 'dsh-plugin-restart: change settle timer')
+  }
 
   /**
-   * Catch the change DSH does not announce: a rebuilt `link:`-installed plugin.
+   * The one change a restart actually fixes: a loaded Host entry module whose
+   * bytes moved under this generation.
    *
-   * The manager reports installs and toggles, and the watcher reports patch
-   * generations — but rewriting the Host half of a linked plugin in place moves
-   * no patch file and raises no event. Stamping the loaded entry modules is the
-   * only signal that covers it, and it is also the signal a restart can actually
-   * fix (the browser half hot-reloads on its own and is deliberately not watched).
+   * Everything the manager does — install, toggle, patch edit — is applied to the
+   * running Loader tree and is therefore already in effect; prompting for those
+   * was the false alarm. A rebuilt `link:`-installed Host half is different: the
+   * module cache keeps the code this process booted with, no event is raised, and
+   * only a new process reads the new file. That comparison is the prompt.
+   *
+   * The browser half is deliberately NOT watched: it hot-reloads on its own and a
+   * restart buys nothing.
    */
   if (config.prompt && config.watchModules) {
-    // Cordis gates EVERY un-injected property read on this context, and reading
-    // one throws instead of returning undefined: `ctx.baseDir` without an
-    // `inject: ['baseDir']` row killed the whole activation on 0.2.1-rc.2 (the
-    // Loader marked the entry 异常 and every route 404'd). The whole block is
-    // therefore wrapped: a watcher that cannot see its files must never cost the
-    // restart button.
-    try {
-      const fromLoader = collectHostModules(ctx)
-      // The Loader does not always publish entry filenames (measured: it does not
-      // on 0.2.0-rc.2), so the profile's linked dependencies are the fallback.
-      const fromProfile = collectLinkedModules(readProfileDir(ctx))
-      watchedModules = [...new Set([...fromLoader, ...fromProfile])]
-      if (watchedModules.length > 0) {
-        const baseline = snapshotModuleStamps(watchedModules)
-        const handle = setInterval(() => {
-          try {
-            const changed = takeModuleChange(baseline)
-            if (changed === null) return
-            recordPending(config.stateDir, { source: 'module-watch', reason: 'host-module' })
-            ctx.logger?.info?.('dsh-plugin-restart: Host module changed (%s); restart pending', changed)
-          } catch (error) {
-            ctx.logger?.warn?.('dsh-plugin-restart: module watch failed (%s)', error instanceof Error ? error.message : String(error))
-          }
-        }, MODULE_WATCH_MS)
-        if (typeof handle.unref === 'function') handle.unref()
-        if (typeof ctx.effect === 'function') {
-          ctx.effect(() => () => clearInterval(handle), 'dsh-plugin-restart: module watch')
-        }
+    // `rebindWatchedModules` swallows a failed read; a watcher that cannot see its
+    // files must never cost the restart button (see the 0.2.1-rc.2 `ctx.baseDir`
+    // incident in README).
+    rebindWatchedModules()
+    if (watchedModules.length > 0) {
+      const handle = setInterval(reportMovedModule, MODULE_WATCH_MS)
+      if (typeof handle.unref === 'function') handle.unref()
+      if (typeof ctx.effect === 'function') {
+        ctx.effect(() => () => clearInterval(handle), 'dsh-plugin-restart: module watch')
       }
-    } catch (error) {
-      ctx.logger?.warn?.('dsh-plugin-restart: module watch disabled (%s)', error instanceof Error ? error.message : String(error))
     }
   }
 

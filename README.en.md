@@ -163,23 +163,24 @@ Uninstall: `& $dsh plugin --profile desktop remove dsh-plugin-restart`.
 
 ### The end-of-reply prompt (when it appears)
 
-The Host listens to four signals: three DSH publishes itself, plus the timestamps of the Host entry modules it actually loaded. It never guesses from file contents:
+**One case raises the prompt: a loaded Host entry module was rewritten.** The evidence is its real `mtimeMs:size` stamp — never a guess about file contents or intent.
 
-| Signal | Meaning |
+That boundary was corrected against the running app (2026-10-20). DSH applies manager operations and patch changes **live**: `plugin-manager/changed` means "a manager operation completed in this process", and `app-boot/config-reload` literally means "profile patches were reconciled into the running Loader tree: every entry update settled and no new inactive entry was introduced". Prompting to restart after those is a false alarm — the plugin is installed and already in effect. Those three events now only **re-bind the baseline** (a fresh install adds modules that were never stamped), and never write a marker.
+
+| Signal | What it is used for now |
 |---|---|
-| `plugin-manager/changed` | a manager operation completed in this process (install / remove / enable / bundle layer) |
-| `plugin-manager/install-state` (`applying`) | an installation has landed on disk |
-| `app-boot/config-reload` | a CLI or hand edit produced a new patch generation that the watcher reconciled |
-| **a loaded Host entry module's `mtime:size` moved** | **a `link:`-installed plugin was rebuilt** — this raises no event at all |
+| `plugin-manager/changed` | already applied live → re-read the baseline after 1.5 s, **no prompt** |
+| `plugin-manager/install-state` (`applying`) | files landed → re-read the baseline, **no prompt** |
+| `app-boot/config-reload` | patches reconciled into the Loader tree → re-read the baseline, **no prompt** |
+| **a loaded Host entry module's `mtimeMs:size` moved** | **a `link:`-installed plugin's Host half was rebuilt** — the running process still holds the old code, so **only a restart replaces it → prompt** |
 
-The last row is the reason this plugin exists: the manager announces installs and the watcher announces patch generations, but rewriting a linked plugin's Host half in place announces nothing. Every 3 seconds the entry module of each Loader entry is stamped (`mtimeMs:size`); a moved stamp records a change. Only **entry modules** are watched — the browser half hot-reloads, so watching whole package directories would report changes a restart cannot improve.
+That last row is the reason this plugin exists: the manager announces installs and the watcher announces patch generations, but rewriting a linked plugin's Host half in place announces nothing. Every 3 seconds the entry module of each Loader entry is stamped; a moved stamp records a change. Only **entry modules** are watched — the browser half hot-reloads, so watching whole package directories would report changes a restart cannot improve.
 
-Any of them writes `<DSH_HOME>\dsh-plugin-restart\pending-restart.json` (timestamp, source, and **the writing process's pid**). The next completed reply reads it, so the card sits at the end of that reply:
+A hit writes `<DSH_HOME>\dsh-plugin-restart\pending-restart.json` (timestamp, source, and **the writing process's pid**). The next completed reply reads it, so the card sits at the end of that reply:
 
 - It renders on the **timeline's last Turn only**, so scrolling history never repaints the same card.
-- **Later** only stamps `dismissedAt`; the next plugin change brings it back.
+- **Later** only stamps `dismissedAt`; the next real rebuild brings it back.
 - After a restart the new process sees a marker whose `pid` is not its own and clears it. (That pid is the whole "was this change honoured by a restart?" judgement; an in-process plugin reload does not clear it.)
-- `config-reload` within the first 4 seconds after boot is treated as the startup reconcile and ignored, so the app never opens with a prompt.
 - With `prompt: false` the Host does not even write the marker.
 
 The marker is one file; deleting it means "nothing is pending":
@@ -213,8 +214,8 @@ Two ways to change it, the first preferred:
   config:
     enabled: true         # false disables the restart routes (they answer 409)
     position: sidebar-footer # sidebar-footer / session-header / composer-input / composer-dock / off
-    prompt: true          # prompt at the end of the reply after a plugin change (false = no marker at all)
-    watchModules: true    # stamp loaded Host entry modules every 3s so a rebuilt linked plugin is noticed
+    prompt: true          # prompt at the end of the reply when a loaded Host entry module was rewritten (false = no marker at all)
+    watchModules: true    # stamp loaded Host entry modules every 3s — the only evidence the prompt has
     armDelayMs: 1200      # Host side: delay between the HTTP answer and the supervisor launch
     graceMs: 2000         # how long the app may exit on its own before its tree is force-killed
     dryRun: true          # return the plan only, never restart (troubleshooting)
@@ -272,14 +273,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 | Suite | Runtime | Checks | Covers |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 25 | manifest/patch/trust gate/tokenizer/config clamping/**seat presets**/**UI preference precedence**/**pending-marker lifecycle**/**the change signals**/**rebuilt-module stamp detection**/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
+| `tests/selfcheck.mjs` | Node | 25 | manifest/patch/trust gate/tokenizer/config clamping/**seat presets**/**UI preference precedence**/**pending-marker lifecycle**/**a settled change raises no prompt**/**rebuilt-module stamp detection**/**a cordis-gated context cannot take the plugin down**/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
 | `tests/ui-render.mjs` | Node (`node:vm`) | 38 | the browser half **really rendered**: six seats, an unselected seat renders null, icon-only trigger, the sidebar-inset confirmation after a press, title and muted note as separate elements, panel width from the sidebar column variables, **the end-of-reply prompt (last Turn only)**, **Later** posting `/dismiss`, **the plugin-page settings section (five presets + switch, nothing on other pages)**, no rect maths (`--control` gives the negative control) |
-| `tests/routes.mjs` | Node | 32 | HTTP route contract (fake ctx + fake req/res, zero side effects): status/restart/`state`/`settings`/`dismiss`, seat writes and illegal-value fallback, the prompt switch, the pending marker and its dismissal |
+| `tests/routes.mjs` | Node | 33 | HTTP route contract (fake ctx + fake req/res, zero side effects): status/restart/`state`/`settings`/`dismiss`, seat writes and illegal-value fallback, the prompt switch, the pending marker and its dismissal, **all five routes mounting on a cordis-gated context** |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | the supervisor really stops stand-ins, relaunches as-is, writes its result, refuses a missing exe, `-NoRelaunch`, **the app root stopped first in a parent/child tree** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | the real `buildRestartPlan` + `spawnSupervisor` path (hidden WMI start, supervisorPid, stand-ins) plus the `detached` negative control |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | tray process-control layer, trigger-file contract, BOM-less result, **the Electron main stopped first** |
 
-**147 checks total**: 95 across the three Node suites plus 52 across the three PowerShell suites.
+**148 checks total**: 96 across the three Node suites plus 52 across the three PowerShell suites.
 
 **Read this before running on another machine or in CI** (environment only, nothing to do with correctness):
 

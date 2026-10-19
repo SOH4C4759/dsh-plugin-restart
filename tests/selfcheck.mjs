@@ -305,18 +305,62 @@ await check('the watcher falls back to the profile’s linked dependencies', asy
   }
 })
 
-await check('the host listens to the three real change signals', () => {
-  const source = readFileSync(join(packageRoot, 'index.js'), 'utf8')
-  for (const event of ['plugin-manager/changed', 'plugin-manager/install-state', 'app-boot/config-reload']) {
-    assert.ok(source.includes(event), `the host must listen to ${event}`)
+await check('a settled plugin change never raises the restart prompt', async () => {
+  // DSH applies manager operations and patch generations to the running Loader
+  // tree: `app-boot/config-reload` means "every entry update settled". Prompting
+  // for those is the false alarm a user sees as "已经生效了还在让我重启". The
+  // listeners must exist (they re-bind the watcher) and must NOT write a marker.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-restart-settle-'))
+  try {
+    const handlers = new Map()
+    const routes = new Map()
+    const ctx = {
+      webServer: {
+        register(route) {
+          routes.set(route.path, route)
+          return () => routes.delete(route.path)
+        },
+      },
+      logger: { info() {}, warn() {} },
+      effect(callback) {
+        const disposer = callback()
+        return typeof disposer === 'function' ? disposer : () => {}
+      },
+      on(event, handler) {
+        handlers.set(event, handler)
+        return () => handlers.delete(event)
+      },
+      get() {
+        return undefined
+      },
+    }
+    const previousHome = process.env.DSH_HOME
+    process.env.DSH_HOME = dir
+    try {
+      host.apply(ctx, {})
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+    }
+    const cases = [
+      ['plugin-manager/changed', { reason: 'install' }],
+      ['plugin-manager/install-state', { phase: 'applying' }],
+      ['app-boot/config-reload', undefined],
+    ]
+    for (const [event, payload] of cases) {
+      const handler = handlers.get(event)
+      assert.equal(typeof handler, 'function', `the host must listen to ${event}`)
+      handler(payload)
+    }
+    assert.equal(host.readPending(dir), null, 'an already-applied change must not ask for a restart')
+    // The one signal that does prompt is a rebuilt Host module, and only it.
+    const source = readFileSync(join(packageRoot, 'index.js'), 'utf8')
+    assert.ok(source.includes('module-watch'), 'the rebuilt-module signal must stay wired')
+    assert.ok(source.includes('stale.pid !== process.pid'), 'a marker from a dead process is cleared at boot')
+    return 'changed/install/config-reload -> no marker'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
-  // `applying` is the phase that means "files are in place"; the earlier phases
-  // describe a download, not a change the user has finished making.
-  assert.ok(source.includes("progress?.phase === 'applying'"), 'only the applying phase records a change')
-  // The startup reconcile must not be mistaken for a user change.
-  assert.ok(source.includes('BOOT_QUIET_MS'), 'the boot quiet window must guard config-reload')
-  assert.ok(source.includes('stale.pid !== process.pid'), 'a marker from a dead process is cleared at boot')
-  return 'changed + install/applying + config-reload'
 })
 
 await check('plan contract matches what the supervisor reads', async () => {

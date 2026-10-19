@@ -8,7 +8,7 @@
 插件迭代后，**点一下界面上的「重启 DSH」按钮**，整个 DeepSeek Harness 桌面应用（Electron 外壳 + Host）会退出并自动重新启动，让刚重建的插件包、组合（bundle）、preset 立即生效。
 
 - **按钮位置可配置**（`position`，5 个预设）：侧栏页脚（默认）、会话标题栏、输入框工具行、输入框下方、不显示按钮。位置既写在 profile patch 里，也能在**「设置 → 插件 → 一键重启 DSH」这一页**直接改，改完即时生效、不需要重启。
-- **回复末尾的自动提示**：Host 收到「插件/组合已变更」的信号后记一个待重启标记；下一轮回复结束时，提示卡直接出现在**这条回复的末尾**（`conversation.chat.turnTail`——DSH 给「完成的一轮回复、动作行之前」的原生席位），一句标题、两个按钮：`稍后` / `立即重启`。它只出现在**最新一轮**上，不会把整段历史都刷一遍；`稍后` 只收起本次，下次插件变更会再出现。
+- **回复末尾的自动提示**：Host 发现**已加载的 Host 入口模块被重写**（只有重启能换掉那一代代码）时才记一个待重启标记；下一轮回复结束时，提示卡直接出现在**这条回复的末尾**（`conversation.chat.turnTail`——DSH 给「完成的一轮回复、动作行之前」的原生席位），一句标题、两个按钮：`稍后` / `立即重启`。它只出现在**最新一轮**上，不会把整段历史都刷一遍；`稍后` 只收起本次，下次真正的重建会再出现。装插件、启停插件、改 patch 都是 DSH **当场生效**的，不会提示。
 - 默认位置是**左下角头像/设置那一排**的图标按钮（`sidebar.footer.action`，`order: 10`）：纯图标、无文字，悬停有提示，点击后在**侧栏内**（不是窗口角落）弹出确认面板——一句标题 `重启 DSH`、一条弱化的范围备注 `（应用与 Host）`，加 取消 / 立即重启。
 - 可选：`tray/tray-host.ps1` 提供 Windows 托盘入口「重启 DSH」，不依赖界面也能重启/拉起。
 
@@ -162,23 +162,24 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/resta
 
 ### 回复末尾的自动提示（什么时候出现）
 
-Host 只认四种信号，全部来自 DSH 自己发布的事件或已加载模块的实际时间戳，不猜文件内容：
+**只有一种情况会提示：已经加载的 Host 入口模块被重写了。** 判断依据是真实的 `mtimeMs:size` 戳，不猜文件内容、不猜意图。
 
-| 信号 | 含义 |
+这条边界是实测校正出来的（2026-10-20）。DSH 对管理器操作与 patch 变更是**当场生效**的——`plugin-manager/changed` 是「本进程里一次管理器操作已完成」，`app-boot/config-reload` 的字面含义是「profile patch 已对进运行中的 Loader 树：每个条目都落定、没有新增未激活条目」。为这些动作弹「重启后生效」是假警报：插件已经装好、已经生效，再让你重启一次是纯粹的打断。现在这三个事件只用来**重取基线**（新装进来的插件有从未盖过戳的模块，得把它们纳入观察），不写任何标记。
+
+| 信号 | 现在的用途 |
 |---|---|
-| `plugin-manager/changed` | 本进程里完成了一次管理器操作（装/卸/启停/组合层变化） |
-| `plugin-manager/install-state`（`applying`） | 一次安装已经落到文件上 |
-| `app-boot/config-reload` | CLI 或手改 patch 后，watcher 把新的 patch 代次并对进 Loader 树 |
-| **已加载 Host 入口模块的 `mtime:size` 变了** | **重建了某个 `link:` 安装的插件**——这类改动不产生任何事件，只改磁盘 |
+| `plugin-manager/changed` | 变更已在运行中应用 → 1.5s 后重取模块基线，**不提示** |
+| `plugin-manager/install-state`（`applying`） | 文件已落地 → 重取基线，**不提示** |
+| `app-boot/config-reload` | patch 已对进 Loader 树 → 重取基线，**不提示** |
+| **已加载 Host 入口模块的 `mtimeMs:size` 变了** | **重建了某个 `link:` 安装的插件的 Host 半边**——运行中的进程仍持有旧代码，**只有重启能换掉它 → 提示** |
 
-最后一条就是本插件存在的理由：管理器会广播安装，watcher 会广播 patch，但**原地重写一个 linked 插件的 Host 半边什么都不广播**。所以每 3 秒给每个 Loader 条目的入口模块盖一次戳（`mtimeMs:size`），戳变了就记一笔。只盯**入口模块**、不盯整个包目录：浏览器半边是热替换的，盯目录只会报出「重启也修不好」的变化。
+最后一条就是本插件存在的理由：管理器会广播安装，watcher 会广播 patch，但**原地重写一个 linked 插件的 Host 半边什么都不广播**。所以每 3 秒给每个 Loader 条目的入口模块盖一次戳，戳变了就记一笔。只盯**入口模块**、不盯整个包目录：浏览器半边是热替换的，盯目录只会报出「重启也修不好」的变化。
 
-命中任一信号 → 写 `<DSH_HOME>\dsh-plugin-restart\pending-restart.json`（记录时间、来源、**写入进程的 pid**）。提示卡在下一轮对话结束时读到它，于是出现在**这条回复的末尾**：
+命中 → 写 `<DSH_HOME>\dsh-plugin-restart\pending-restart.json`（记录时间、来源、**写入进程的 pid**）。提示卡在下一轮对话结束时读到它，于是出现在**这条回复的末尾**：
 
 - 只出现在**时间线的最后一轮**：往上的历史轮次不会被反复刷出同一张卡。
-- `稍后` 只是给标记补一个 `dismissedAt`，**下次插件变更会重新出现**。
+- `稍后` 只是给标记补一个 `dismissedAt`，**下次真正的重建会重新出现**。
 - 重启成功后，新进程启动时会发现标记的 pid 不是自己 → 自动清掉（`pid` 就是「这次改动有没有被重启兑现」的判据；同进程内的插件重载不会误清）。
-- 启动后 4 秒内的 `config-reload` 视为开机对账、不记标记，避免一打开应用就弹提示。
 - `prompt: false` 时 Host 连标记都不写。
 
 标记只是一个文件，删掉即等于「没有待重启的改动」：
@@ -212,8 +213,8 @@ Remove-Item "$env:USERPROFILE\.dsh\dsh-plugin-restart\pending-restart.json" -Err
   config:
     enabled: true         # 关闭重启路由（返回 409）
     position: sidebar-footer # 按钮位置：sidebar-footer / session-header / composer-input / composer-dock / off
-    prompt: true          # 插件变更后在回复末尾提示重启（false = 不记待重启标记）
-    watchModules: true    # 每 3 秒给已加载的 Host 入口模块盖戳，重建 linked 插件也能被发现
+    prompt: true          # 已加载的 Host 入口模块被重写时，在回复末尾提示重启（false = 不记待重启标记）
+    watchModules: true    # 每 3 秒给已加载的 Host 入口模块盖戳——这是提示的唯一依据
     armDelayMs: 1200      # Host 侧：HTTP 应答与守护脚本启动之间的延迟
     graceMs: 2000         # 等待应用自行退出的时间，超时后强杀进程树
     dryRun: true          # 只返回计划、绝不真正重启（排障用）
@@ -279,14 +280,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 | 套件 | 运行时 | 条数 | 覆盖 |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 25 | manifest/patch/信任门/tokenizer/配置钳制/**座位预设归一化**/**UI 偏好优先级**/**待重启标记生命周期**/**三种变更信号接线**/**重建模块的戳变化检测**/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
+| `tests/selfcheck.mjs` | Node | 25 | manifest/patch/信任门/tokenizer/配置钳制/**座位预设归一化**/**UI 偏好优先级**/**待重启标记生命周期**/**落定的变更不提示**/**重建模块的戳变化检测**/**cordis 门禁上下文不拖垮插件**/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
 | `tests/ui-render.mjs` | Node (`node:vm`) | 38 | 浏览器半**真渲染**：六个席位、未选中席位渲染 null、纯图标触发、按下后侧栏内嵌面板、标题与弱化备注分离、面板宽度取自侧栏列变量、**回复末尾提示卡（仅最后一轮）**、`稍后` 走后端收起、**插件页设置区（5 个预设 + 开关 + 其它插件页不渲染）**、无 rect 计算（配 `--control` 反向对照） |
-| `tests/routes.mjs` | Node | 32 | HTTP 路由契约（假 ctx + 假 req/res，0 副作用）：状态/重启/`state`/`settings`/`dismiss`、座位写入与非法值回落、提示开关、待重启标记与收起 |
+| `tests/routes.mjs` | Node | 33 | HTTP 路由契约（假 ctx + 假 req/res，0 副作用）：状态/重启/`state`/`settings`/`dismiss`、座位写入与非法值回落、提示开关、待重启标记与收起、**cordis 门禁上下文下仍挂满五条路由** |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | 守护脚本真杀替身进程、按原样重启、写结果、防误杀守卫、no-launch 开关、**父+子树形下的「先杀应用根」顺序** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | Host 真实 `buildRestartPlan` + `spawnSupervisor` 全链路（WMI 隐藏启动、supervisorPid、替身进程）+ `detached` 反例对照 |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | 托盘进程控制层 + 触发文件契约 + 无 BOM 结果 + **先杀 Electron 主进程** |
 
-合计 **147 项**断言：3 个 Node 套件共 95 项 + 3 个 PowerShell 套件共 52 项。
+合计 **148 项**断言：3 个 Node 套件共 96 项 + 3 个 PowerShell 套件共 52 项。
 
 **换机器 / 上 CI 前必读**（与代码正确性无关，只与运行环境有关）：
 
@@ -318,7 +319,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 - **真实重启不可由代理自测**（重启会杀掉执行测试的进程）。因此仓库内只做非破坏性验证：路由契约、dry-run 计划、信任门、脚本语法、客户端注册。
 - **从 1.0.x 升级到 1.1.0 后需要重启一次**：浏览器半边会随 client-hmr 立刻换成新代码（四个席位立刻出现在 Slot 账本里），但新路由（`/state`、`/settings`、`/dismiss`）与事件监听在 Host 半边，必须换进程才生效。重启前新客户端会读不到 `/state`、把提示功能标成离线——按钮仍然可用，不会出错。
 - **回复末尾提示的座位是 `conversation.chat.turnTail`**（DSH 的原生位置：「一轮完成、动作行之前」）。它按**时间线最后一轮**过滤，所以历史轮不会重复弹；换 DSH 大版本时若该席位或 `useChat` 的标准 props 改名，提示会退化——`useChat` 缺失时按「始终是最新一轮」处理，宁可在历史轮里安全地多显示，也不静默消失。
-- **「插件变更」的三个事件信号 + 一个文件戳信号**（`plugin-manager/changed`、`plugin-manager/install-state` 的 `applying`、`app-boot/config-reload`，以及每 3 秒给已加载 Host 入口模块盖的 `mtimeMs:size`）。事件描述「变更有发生」，不保证「必须重启」——DSH 的管理器自己还会区分 `restart-required` / `applied`。因此提示的措辞是「重启后生效」，而不是「必须重启」；是否需要重启由你判断，点不点都能继续用。模块戳会有误报（例如构建工具连续重写入口文件），代价只是一张可收起的提示卡。
+- **提示的触发条件只有一个：已加载 Host 入口模块的 `mtimeMs:size` 变了**（每 3 秒盖一次戳）。管理器那三个事件（`plugin-manager/changed`、`plugin-manager/install-state` 的 `applying`、`app-boot/config-reload`）只用来重取基线，**不提示**——它们在 DSH 里都是当场生效的（`config-reload` 的定义就是「每个条目都已落定」）。2026-10-20 修掉的正是这个假警报：装完、启停完、patch 改完，插件已经在跑，再让用户重启一次是打断。模块戳会有误报（构建工具连续重写入口文件），代价只是一张可收起的提示卡。
 - 四个触发席位在加载时全部注册、未选中的渲染 `null`。这样换位置是纯数据更新；代价是 Slot 账本里能看到四个 `dsh-restart` 占位（每个都没有布局）。
 - 面板在标题栏/输入框这两个席位是**绝对定位的浮层**，会覆盖到会话内容上；如果将来 DSH 给这些行加了 `overflow: hidden`，这两个座位的面板会被裁切（页脚座位是贴侧栏列宽的，不受影响）。遇到这种情况换回 `sidebar-footer` 即可。
 - `dsh.client.inject` 声明了 `@deepseek-ai/dsh-client-ui-conversation`，用于保证侧边栏页脚插槽所在的 UI 包先于本插件加载；`client.js` 本身只 `require('react')`。
