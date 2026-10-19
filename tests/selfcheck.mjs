@@ -6,7 +6,7 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -238,6 +238,68 @@ await check('the rebuilt-Host-module watcher detects a rewrite', async () => {
     assert.ok(source.includes('unref'), 'the watcher must not keep the Host alive')
     assert.ok(source.includes('module-watch'), 'the marker must name its source')
     return 'stamp -> rewrite -> one report'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('a cordis-gated context cannot take the plugin down with it', async () => {
+  // 0.2.1-rc.2 gates every un-injected property read on the context and THROWS.
+  // Reading `ctx.baseDir` that way once aborted the whole activation: the Loader
+  // marked the entry 异常 and every route answered 404, which the browser half
+  // surfaced as 「保存失败，请稍后重试。」. The reader must swallow it and fall
+  // back, never propagate.
+  const gated = new Proxy({ baseDir: 'ignored' }, {
+    get(target, property) {
+      if (property === 'baseDir') throw new Error('cannot get property "baseDir" without inject')
+      return Reflect.get(target, property)
+    },
+  })
+  assert.equal(host.readProfileDir(gated, ''), '', 'a gated baseDir yields no directory, not an exception')
+  assert.equal(host.readProfileDir(gated, 'C:/fallback'), 'C:/fallback', 'the Host argv is the fallback')
+  assert.equal(host.readProfileDir({ baseDir: 'C:/profile' }, ''), 'C:/profile', 'a plain context is still read')
+  // The Loader service's own baseDir is readable even when the context property is not.
+  const loaderOnly = { get: (name) => (name === 'loader' ? { baseDir: 'C:/from-loader' } : undefined) }
+  assert.equal(host.readProfileDir(loaderOnly, ''), 'C:/from-loader')
+  // The wrapper must leave a trace: a silent failure is what cost an hour here.
+  const source = readFileSync(join(packageRoot, 'index.js'), 'utf8')
+  assert.ok(source.includes('apply-error.log'), 'a failed activation must write its stack somewhere readable')
+  return 'gated read -> fallback, no throw'
+})
+
+await check('the watcher falls back to the profile’s linked dependencies', async () => {
+  // Measured: the Loader publishes no entry filenames on 0.2.0-rc.2, so the
+  // profile manifest is what makes the signal real. A temp profile proves the
+  // derivation without touching the live one.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-restart-profile-'))
+  try {
+    const linked = join(dir, 'linked-plugin')
+    mkdirSync(join(linked, 'lib'), { recursive: true })
+    writeFileSync(join(linked, 'package.json'), JSON.stringify({ name: 'linked-plugin', main: 'lib/main.js' }), 'utf8')
+    writeFileSync(join(linked, 'lib', 'main.js'), 'export const n = 1\n', 'utf8')
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      dependencies: {
+        'linked-plugin': 'link:F:/somewhere/linked-plugin',
+        'registry-plugin': '^1.0.0',
+      },
+    }), 'utf8')
+    // The link target does not exist, so the name falls back to node_modules —
+    // which also does not exist here. Prove that shape is harmless...
+    assert.deepEqual(host.collectLinkedModules(dir), [], 'an unresolvable link contributes nothing')
+
+    // ...then prove the real shape: link target on disk, entry declared by `main`.
+    const profile2 = join(dir, 'profile2')
+    mkdirSync(profile2, { recursive: true })
+    writeFileSync(join(profile2, 'package.json'), JSON.stringify({
+      dependencies: { 'linked-plugin': `link:${linked.replace(/\\/g, '/')}` },
+    }), 'utf8')
+    const files = host.collectLinkedModules(profile2)
+    assert.equal(files.length, 1, JSON.stringify(files))
+    assert.ok(files[0].replace(/\\/g, '/').endsWith('lib/main.js'), files[0])
+    assert.deepEqual(host.collectLinkedModules(''), [])
+    assert.equal(host.resolvePackageEntry({ exports: { '.': { import: './x.js' } } }), './x.js')
+    assert.equal(host.resolvePackageEntry({}), 'index.js')
+    return 'profile manifest -> entry module'
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

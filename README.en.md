@@ -14,6 +14,17 @@ After you rebuild a plugin, **click the "Restart DSH" button in the UI** and the
 
 This package **does not patch DSH source and does not need a fork**: it is a standard profile bundle (`dsh.bundle.patch` + `dsh.client`) that you install into your own profile.
 
+## Video
+
+A multi-part walkthrough on Bilibili: [One-click DSH restart](https://www.bilibili.com/video/BV1qxpA6aE1X/)
+
+- **P1** how you know a plugin build took effect (the original v1.0 explainer)
+- **P2** v1.1.0 · overview: stop remembering to restart
+- **P3** v1.1.0 · the end-of-reply prompt
+- **P4** v1.1.0 · a configurable button position
+
+Every frame in the update parts is a screenshot of the running app on the author's machine, not a mock-up.
+
 ## Requirements
 
 | Item | Requirement | Why |
@@ -250,25 +261,25 @@ Prerequisites: **Windows 10/11 + Windows PowerShell 5.1** (`powershell.exe`; pws
 # Defaults to the local desktop install; on another machine, point $node at your node.exe
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 23 checks
+& $node tests\selfcheck.mjs                                                  # 25 checks
 & $node tests\ui-render.mjs                                                  # 38 checks (stub-React render of the browser half)
 & $node tests\ui-render.mjs --bundle <old client.js> --control               # negative control: the old bundle must fail
 & $node tests\routes.mjs                                                     # 32 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 18 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 checks
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 23 checks
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 25 checks
 ```
 
 | Suite | Runtime | Checks | Covers |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 23 | manifest/patch/trust gate/tokenizer/config clamping/**seat presets**/**UI preference precedence**/**pending-marker lifecycle**/**the change signals**/**rebuilt-module stamp detection**/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
+| `tests/selfcheck.mjs` | Node | 25 | manifest/patch/trust gate/tokenizer/config clamping/**seat presets**/**UI preference precedence**/**pending-marker lifecycle**/**the change signals**/**rebuilt-module stamp detection**/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
 | `tests/ui-render.mjs` | Node (`node:vm`) | 38 | the browser half **really rendered**: six seats, an unselected seat renders null, icon-only trigger, the sidebar-inset confirmation after a press, title and muted note as separate elements, panel width from the sidebar column variables, **the end-of-reply prompt (last Turn only)**, **Later** posting `/dismiss`, **the plugin-page settings section (five presets + switch, nothing on other pages)**, no rect maths (`--control` gives the negative control) |
 | `tests/routes.mjs` | Node | 32 | HTTP route contract (fake ctx + fake req/res, zero side effects): status/restart/`state`/`settings`/`dismiss`, seat writes and illegal-value fallback, the prompt switch, the pending marker and its dismissal |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | the supervisor really stops stand-ins, relaunches as-is, writes its result, refuses a missing exe, `-NoRelaunch`, **the app root stopped first in a parent/child tree** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | the real `buildRestartPlan` + `spawnSupervisor` path (hidden WMI start, supervisorPid, stand-ins) plus the `detached` negative control |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | tray process-control layer, trigger-file contract, BOM-less result, **the Electron main stopped first** |
 
-**145 checks total**: 93 across the three Node suites plus 52 across the three PowerShell suites.
+**147 checks total**: 95 across the three Node suites plus 52 across the three PowerShell suites.
 
 **Read this before running on another machine or in CI** (environment only, nothing to do with correctness):
 
@@ -296,6 +307,7 @@ After one app restart you can also ask the **running Host** what it resolved, us
 
 ## Known limits
 
+- **cordis turns an un-injected context property read into a throw, not `undefined`** (measured 2026-10-20: on DSH `0.2.1-rc.2`, `ctx.baseDir` raised `cannot get property "baseDir" without inject`, the whole Host activation aborted, the Loader marked the entry 异常, all five routes answered 404, and every settings click in the browser half showed 「保存失败，请稍后重试。」). Every gated read now goes through `readProfileDir`, which swallows the throw and falls back, and `apply` itself is wrapped: a failed activation writes its stack to `<DSH_HOME>/dsh-plugin-restart/apply-error.log` before rethrowing. **When touching the Host half, never read `ctx.xxx` without `try/catch`.**
 - **A real restart cannot be self-tested by an agent** (the restart kills the process running the tests). The repository therefore ships non-destructive verification only: route contract, dry-run plan, trust gate, script syntax, client registration.
 - **Upgrading from 1.0.x to 1.1.0 needs one restart**: the browser half is replaced by client-hmr immediately (all four seats show up in the slot ledger), but the new routes (`/state`, `/settings`, `/dismiss`) and the change listeners live in the Host half, which only changes with a new process. Until that restart the new client cannot read `/state` and treats the prompt feature as offline — the button itself keeps working.
 - **The end-of-reply prompt lives in `conversation.chat.turnTail`** (DSH's native "before a completed Turn's action row" seat). It filters by **the timeline's last Turn**, so history is never repainted; if a future DSH major renames that seat or the `useChat` standard prop, the prompt degrades — a missing `useChat` is treated as "always the last Turn", which safely over-shows instead of silently disappearing.

@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-restart",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "One-click DSH restart: a restart button that can live in several seats (with presets), an automatic end-of-reply prompt after a plugin change, and a detached supervisor that relaunches the DeepSeek Harness desktop app.",
   "type": "module",
   "icon": "./icon.svg",

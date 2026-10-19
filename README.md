@@ -14,6 +14,17 @@
 
 本包**不修改 DSH 源码、不需要 fork**：它是一个标准 profile bundle（`dsh.bundle.patch` + `dsh.client`），装进当前 profile 即可。
 
+## 视频
+
+分 P 讲解（B 站）：[【工具演示】一键重启 DSH](https://www.bilibili.com/video/BV1qxpA6aE1X/)
+
+- **P1** 装完插件，点一下就知道生效了没有（v1.0 的原始讲解）
+- **P2** v1.1.0 · 总览：不用再自己记着重启
+- **P3** v1.1.0 · 回复末尾的自动提示
+- **P4** v1.1.0 · 按钮位置可配置
+
+片子里的画面都是这台机器上运行中的应用截图，不是示意图。
+
 ## 环境要求
 
 | 项 | 要求 | 为什么 |
@@ -257,25 +268,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell
 # 默认走本机安装目录；其它机器请把 $node 改成本机 node.exe 路径
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 23 项
+& $node tests\selfcheck.mjs                                                  # 25 项
 & $node tests\ui-render.mjs                                                  # 38 项（桩 React 真渲染浏览器半）
 & $node tests\ui-render.mjs --bundle <旧版 client.js> --control              # 反向对照：旧版必须失败
 & $node tests\routes.mjs                                                     # 32 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 18 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 项
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 23 项
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 25 项
 ```
 
 | 套件 | 运行时 | 条数 | 覆盖 |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 23 | manifest/patch/信任门/tokenizer/配置钳制/**座位预设归一化**/**UI 偏好优先级**/**待重启标记生命周期**/**三种变更信号接线**/**重建模块的戳变化检测**/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
+| `tests/selfcheck.mjs` | Node | 25 | manifest/patch/信任门/tokenizer/配置钳制/**座位预设归一化**/**UI 偏好优先级**/**待重启标记生命周期**/**三种变更信号接线**/**重建模块的戳变化检测**/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
 | `tests/ui-render.mjs` | Node (`node:vm`) | 38 | 浏览器半**真渲染**：六个席位、未选中席位渲染 null、纯图标触发、按下后侧栏内嵌面板、标题与弱化备注分离、面板宽度取自侧栏列变量、**回复末尾提示卡（仅最后一轮）**、`稍后` 走后端收起、**插件页设置区（5 个预设 + 开关 + 其它插件页不渲染）**、无 rect 计算（配 `--control` 反向对照） |
 | `tests/routes.mjs` | Node | 32 | HTTP 路由契约（假 ctx + 假 req/res，0 副作用）：状态/重启/`state`/`settings`/`dismiss`、座位写入与非法值回落、提示开关、待重启标记与收起 |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | 守护脚本真杀替身进程、按原样重启、写结果、防误杀守卫、no-launch 开关、**父+子树形下的「先杀应用根」顺序** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | Host 真实 `buildRestartPlan` + `spawnSupervisor` 全链路（WMI 隐藏启动、supervisorPid、替身进程）+ `detached` 反例对照 |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | 托盘进程控制层 + 触发文件契约 + 无 BOM 结果 + **先杀 Electron 主进程** |
 
-合计 **145 项**断言：3 个 Node 套件共 93 项 + 3 个 PowerShell 套件共 52 项。
+合计 **147 项**断言：3 个 Node 套件共 95 项 + 3 个 PowerShell 套件共 52 项。
 
 **换机器 / 上 CI 前必读**（与代码正确性无关，只与运行环境有关）：
 
@@ -303,6 +314,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 ## 已知边界
 
+- **cordis 会把「没 inject 的上下文属性」读成异常，而不是 `undefined`**（2026-10-20 实测代价：DSH `0.2.1-rc.2` 上 `ctx.baseDir` 抛 `cannot get property "baseDir" without inject`，整条 Host 半边激活失败 → Loader 标「异常」→ 五个路由全 404 → 设置页每次点击都显示「保存失败，请稍后重试。」）。现在所有可能被门禁的属性读取都走 `try/catch` 兜底（`readProfileDir`），并且 `apply` 整体包了一层：失败会把栈写进 `<DSH_HOME>/dsh-plugin-restart/apply-error.log` 再抛给 Loader，不再无声消失。**改 Host 半边时不要直接读 `ctx.xxx`**，要读就先包 `try/catch`。
 - **真实重启不可由代理自测**（重启会杀掉执行测试的进程）。因此仓库内只做非破坏性验证：路由契约、dry-run 计划、信任门、脚本语法、客户端注册。
 - **从 1.0.x 升级到 1.1.0 后需要重启一次**：浏览器半边会随 client-hmr 立刻换成新代码（四个席位立刻出现在 Slot 账本里），但新路由（`/state`、`/settings`、`/dismiss`）与事件监听在 Host 半边，必须换进程才生效。重启前新客户端会读不到 `/state`、把提示功能标成离线——按钮仍然可用，不会出错。
 - **回复末尾提示的座位是 `conversation.chat.turnTail`**（DSH 的原生位置：「一轮完成、动作行之前」）。它按**时间线最后一轮**过滤，所以历史轮不会重复弹；换 DSH 大版本时若该席位或 `useChat` 的标准 props 改名，提示会退化——`useChat` 缺失时按「始终是最新一轮」处理，宁可在历史轮里安全地多显示，也不静默消失。

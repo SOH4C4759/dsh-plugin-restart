@@ -29,7 +29,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -455,6 +455,66 @@ export function collectHostModules(ctx) {
     return []
   }
   return [...files]
+}
+
+/**
+ * Entry modules of the profile's LINKED dependencies.
+ *
+ * Measured 2026-10-19 on DSH 0.2.0-rc.2: the Loader's entries carry no
+ * `filename`, so {@link collectHostModules} reports nothing here. The profile's
+ * own manifest still names every linked package, and each one's `package.json`
+ * names its Host entry — that is enough to watch the file a rebuild rewrites.
+ * @param {string} baseDir - profile directory (cordis `ctx.baseDir`).
+ * @returns {string[]} absolute module paths, possibly empty.
+ */
+export function collectLinkedModules(baseDir) {
+  if (typeof baseDir !== 'string' || baseDir === '') return []
+  let manifest
+  try {
+    manifest = JSON.parse(readFileSync(join(baseDir, 'package.json'), 'utf8'))
+  } catch {
+    return []
+  }
+  const dependencies = manifest?.dependencies
+  if (dependencies === null || typeof dependencies !== 'object') return []
+  const files = new Set()
+  for (const [name, spec] of Object.entries(dependencies)) {
+    if (typeof spec !== 'string') continue
+    if (!/^(link|file):/i.test(spec) && !/^[.\\/]/.test(spec)) continue
+    const target = spec.replace(/^(link|file):/i, '')
+    const raw = /^[a-zA-Z]:[\\/]/.test(target) || target.startsWith('\\\\')
+      ? target
+      : join(baseDir, 'node_modules', name)
+    let pkg
+    try {
+      pkg = JSON.parse(readFileSync(join(raw, 'package.json'), 'utf8'))
+    } catch {
+      continue
+    }
+    const entry = resolvePackageEntry(pkg)
+    if (entry !== '') files.add(join(raw, entry))
+  }
+  return [...files]
+}
+
+/**
+ * The Host entry a package manifest declares.
+ * @param {object} pkg - parsed package.json.
+ * @returns {string} a relative module path, or '' when none is declared.
+ */
+export function resolvePackageEntry(pkg) {
+  if (typeof pkg?.main === 'string' && pkg.main !== '') return pkg.main
+  const root = pkg?.exports
+  if (typeof root === 'string') return root
+  if (root !== null && typeof root === 'object') {
+    const dot = root['.'] ?? root['./']
+    if (typeof dot === 'string') return dot
+    if (dot !== null && typeof dot === 'object') {
+      const value = dot.import ?? dot.default ?? dot.require
+      if (typeof value === 'string') return value
+    }
+  }
+  return 'index.js'
 }
 
 /**
@@ -939,11 +999,71 @@ export function resolveConfig(raw, env = process.env) {
 }
 
 /**
+ * The profile directory this Host was started for, read without tripping the
+ * context proxy.
+ *
+ * Three sources, cheapest and most stable first:
+ *  1. `ctx.baseDir` — plain property on a plain Context, but cordis gates it
+ *     unless the plugin declares it, and a gated read THROWS (`cannot get
+ *     property "baseDir" without inject`). Hence the try/catch.
+ *  2. the Loader service's own `baseDir` — the profile, taken from the service
+ *     object instead of the gated context property.
+ *  3. the Host argv — the desktop host is launched as
+ *     `… dsh-desktop-host/lib/index.js <dsh> <profile> <runtime> …`.
+ * @param {object} ctx - Host plugin context.
+ * @param {string} [argvProfileDir] - override for tests (defaults to argv[3]).
+ * @returns {string} an absolute directory, or '' when none is readable.
+ */
+export function readProfileDir(ctx, argvProfileDir = process.argv[3]) {
+  try {
+    const baseDir = ctx?.baseDir
+    if (typeof baseDir === 'string' && baseDir !== '') return baseDir
+  } catch {
+    /* gated by cordis: fall through to the sources that are readable */
+  }
+  try {
+    const loader = ctx?.get?.('loader')
+    const baseDir = loader?.baseDir
+    if (typeof baseDir === 'string' && baseDir !== '') return baseDir
+  } catch {
+    /* a Loader without baseDir is not an error */
+  }
+  return typeof argvProfileDir === 'string' && argvProfileDir !== '' ? argvProfileDir : ''
+}
+
+/**
  * Mount the restart routes.
  * @param {object} ctx - Host plugin context carrying `webServer`.
  * @param {object} [rawConfig] - row config from the profile patch.
  */
 export function apply(ctx, rawConfig) {
+  try {
+    return applyHost(ctx, rawConfig)
+  } catch (error) {
+    // A throw here is invisible in the running app: the Loader marks the entry
+    // 异常 and the only symptom the user sees is a 404 on every route. Leave the
+    // real stack where it can be read back, then let the Loader fail as before.
+    try {
+      const dir = resolveStateDir()
+      mkdirSync(dir, { recursive: true })
+      appendFileSync(
+        join(dir, 'apply-error.log'),
+        `${new Date().toISOString()} ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`,
+        'utf8',
+      )
+    } catch {
+      /* diagnostics must never mask the original failure */
+    }
+    throw error
+  }
+}
+
+/**
+ * The real mount. Split out so {@link apply} can record a failed activation.
+ * @param {object} ctx - Host plugin context carrying `webServer`.
+ * @param {object} [rawConfig] - row config from the profile patch.
+ */
+function applyHost(ctx, rawConfig) {
   const config = resolveConfig(rawConfig)
   const loaderPackageDir = resolveLoaderPackageDir(ctx) ?? config.loaderPackageDir
   const supervisor = resolveSupervisorScript(config.supervisorPath, loaderPackageDir)
@@ -1216,23 +1336,37 @@ export function apply(ctx, rawConfig) {
    * fix (the browser half hot-reloads on its own and is deliberately not watched).
    */
   if (config.prompt && config.watchModules) {
-    watchedModules = collectHostModules(ctx)
-    if (watchedModules.length > 0) {
-      const baseline = snapshotModuleStamps(watchedModules)
-      const handle = setInterval(() => {
-        try {
-          const changed = takeModuleChange(baseline)
-          if (changed === null) return
-          recordPending(config.stateDir, { source: 'module-watch', reason: 'host-module' })
-          ctx.logger?.info?.('dsh-plugin-restart: Host module changed (%s); restart pending', changed)
-        } catch (error) {
-          ctx.logger?.warn?.('dsh-plugin-restart: module watch failed (%s)', error instanceof Error ? error.message : String(error))
+    // Cordis gates EVERY un-injected property read on this context, and reading
+    // one throws instead of returning undefined: `ctx.baseDir` without an
+    // `inject: ['baseDir']` row killed the whole activation on 0.2.1-rc.2 (the
+    // Loader marked the entry 异常 and every route 404'd). The whole block is
+    // therefore wrapped: a watcher that cannot see its files must never cost the
+    // restart button.
+    try {
+      const fromLoader = collectHostModules(ctx)
+      // The Loader does not always publish entry filenames (measured: it does not
+      // on 0.2.0-rc.2), so the profile's linked dependencies are the fallback.
+      const fromProfile = collectLinkedModules(readProfileDir(ctx))
+      watchedModules = [...new Set([...fromLoader, ...fromProfile])]
+      if (watchedModules.length > 0) {
+        const baseline = snapshotModuleStamps(watchedModules)
+        const handle = setInterval(() => {
+          try {
+            const changed = takeModuleChange(baseline)
+            if (changed === null) return
+            recordPending(config.stateDir, { source: 'module-watch', reason: 'host-module' })
+            ctx.logger?.info?.('dsh-plugin-restart: Host module changed (%s); restart pending', changed)
+          } catch (error) {
+            ctx.logger?.warn?.('dsh-plugin-restart: module watch failed (%s)', error instanceof Error ? error.message : String(error))
+          }
+        }, MODULE_WATCH_MS)
+        if (typeof handle.unref === 'function') handle.unref()
+        if (typeof ctx.effect === 'function') {
+          ctx.effect(() => () => clearInterval(handle), 'dsh-plugin-restart: module watch')
         }
-      }, MODULE_WATCH_MS)
-      if (typeof handle.unref === 'function') handle.unref()
-      if (typeof ctx.effect === 'function') {
-        ctx.effect(() => () => clearInterval(handle), 'dsh-plugin-restart: module watch')
       }
+    } catch (error) {
+      ctx.logger?.warn?.('dsh-plugin-restart: module watch disabled (%s)', error instanceof Error ? error.message : String(error))
     }
   }
 

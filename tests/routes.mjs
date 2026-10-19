@@ -89,6 +89,57 @@ function mount(config, stateDir) {
   return routes
 }
 
+/**
+ * Mount on a context that behaves like cordis: an un-injected property read
+ * THROWS instead of returning undefined.
+ *
+ * This is the 0.2.1-rc.2 failure, encoded: `ctx.baseDir` (no `inject` row for it)
+ * threw `cannot get property "baseDir" without inject` inside apply, the Loader
+ * marked the entry 异常, and every route answered 404 — the browser half then
+ * showed 「保存失败，请稍后重试。」 on every settings click.
+ */
+function mountGated(config, stateDir) {
+  const routes = new Map()
+  const services = {
+    webServer: {
+      register(route) {
+        routes.set(route.path, route)
+        return () => routes.delete(route.path)
+      },
+    },
+  }
+  const base = {
+    // An injected service IS readable on the context; everything else throws.
+    webServer: services.webServer,
+    logger: { info() {}, warn() {} },
+    effect(callback) {
+      const disposer = callback()
+      return typeof disposer === 'function' ? disposer : () => {}
+    },
+    on() {
+      return () => {}
+    },
+    get(name) {
+      return services[name]
+    },
+  }
+  const ctx = new Proxy(base, {
+    get(target, property, receiver) {
+      if (property in target) return Reflect.get(target, property, receiver)
+      throw new Error(`cannot get property "${String(property)}" without inject`)
+    },
+  })
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = stateDir
+  try {
+    host.apply(ctx, config)
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+  return routes
+}
+
 const workDir = join(tmpdir(), `dsh-restart-routes-${String(process.pid)}`)
 mkdirSync(workDir, { recursive: true })
 
@@ -106,6 +157,15 @@ try {
   for (const route of routes.values()) {
     assert.equal(route.kind, 'exact')
   }
+
+  // A cordis context throws on any property this plugin did not inject. The mount
+  // must survive that: one gated read is not allowed to cost the whole button.
+  const gatedRoutes = mountGated({ armDelayMs: 0, graceMs: 300 }, workDir)
+  record(
+    'a cordis-gated context (un-injected reads throw) still mounts every route',
+    gatedRoutes.size === expected.length && expected.every((path) => gatedRoutes.has(path)),
+    [...gatedRoutes.keys()].join(', '),
+  )
 
   const status = routes.get('/api/dsh-restart/status')
   const restart = routes.get('/api/dsh-restart/restart')
