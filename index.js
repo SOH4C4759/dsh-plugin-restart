@@ -10,17 +10,26 @@
  * (including this Host) then goes away while the supervisor relaunches the app.
  *
  * Surface:
- *   POST /api/dsh-restart/status   what a restart would do right now (no side effect)
- *   POST /api/dsh-restart/restart  arm the detached relaunch (dryRun: true = plan only)
+ *   POST /api/dsh-restart/status    what a restart would do right now (no side effect)
+ *   POST /api/dsh-restart/restart   arm the detached relaunch (dryRun: true = plan only)
+ *   POST /api/dsh-restart/state     cheap read: seat/prompt settings + pending marker
+ *   POST /api/dsh-restart/settings  change the seat or the end-of-Turn prompt
+ *   POST /api/dsh-restart/dismiss   hide the prompt until the next plugin change
  *
- * Both routes are loopback-only and same-origin gated, mirroring the trust policy
+ * It also watches what DSH does not announce: the profile's plugin set changes
+ * through the manager, through a CLI/hand-edited patch, and — the case this
+ * plugin exists for — through a REBUILT linked plugin whose Host module changed
+ * on disk without any event at all. All four record one pending-restart marker,
+ * which the browser half reads at the end of the next completed Turn.
+ *
+ * Every route is loopback-only and same-origin gated, mirroring the trust policy
  * the shipped Web-UI settings bridge applies to its own loopback routes.
  *
  * @module dsh-plugin-restart
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -159,6 +168,328 @@ export function resolveDshHome(env = process.env) {
 /** Directory this plugin owns for its trigger, log and result files. */
 export function resolveStateDir(env = process.env) {
   return join(resolveDshHome(env), 'dsh-plugin-restart')
+}
+
+/**
+ * Seats the browser half can put its trigger in, in the order the settings page
+ * lists them.
+ *
+ * Each preset is a REAL slot read from the shipped Client UI (2026-10-19,
+ * DSH `0.2.0-rc.2`): the sidebar foot is a compact control row, the Session
+ * header utilities and the composer toolbar are compact control rows too, and
+ * `conversation.composer.dock` is the ambient strip below the composer card.
+ * `off` registers nothing visible — the end-of-Turn prompt and the settings
+ * section keep working, so the plugin can be kept without a permanent button.
+ */
+export const POSITIONS = ['sidebar-footer', 'session-header', 'composer-input', 'composer-dock', 'off']
+
+/** Default seat: the sidebar foot, where the button has lived since 1.0.0. */
+export const DEFAULT_POSITION = 'sidebar-footer'
+
+/**
+ * Accepted spellings for a seat.
+ *
+ * Clamped rather than rejected: a hand-written patch that misspells a seat must
+ * keep the button at its default place instead of making it disappear, for the
+ * same reason every other option degrades to its default.
+ */
+const POSITION_ALIASES = {
+  'sidebar-footer': 'sidebar-footer',
+  footer: 'sidebar-footer',
+  sidebar: 'sidebar-footer',
+  'sidebar.footer.action': 'sidebar-footer',
+  'session-header': 'session-header',
+  header: 'session-header',
+  'session.header': 'session-header',
+  'session-header-utilities': 'session-header',
+  'composer-input': 'composer-input',
+  input: 'composer-input',
+  'composer-toolbar': 'composer-input',
+  'input-right': 'composer-input',
+  'composer-dock': 'composer-dock',
+  dock: 'composer-dock',
+  'composer-below': 'composer-dock',
+  off: 'off',
+  hidden: 'off',
+  none: 'off',
+  hide: 'off',
+}
+
+/**
+ * Resolve one seat name.
+ * @param {unknown} value - configured value.
+ * @param {string} [fallback] - seat to use for an unknown value.
+ * @returns {string} a member of {@link POSITIONS}, or the fallback.
+ */
+export function normalizePosition(value, fallback = DEFAULT_POSITION) {
+  if (typeof value !== 'string') return fallback
+  return POSITION_ALIASES[value.trim().toLowerCase()] ?? fallback
+}
+
+/** A burst of manager events describes one change; records closer than this merge. */
+const PENDING_MERGE_MS = 4000
+
+/**
+ * How long after this Host starts a config reconcile is treated as startup noise
+ * rather than a change the user just made.
+ *
+ * `app-boot/config-reload` also fires while the profile is being reconciled at
+ * boot, and a prompt that appears the moment the app opens — for a change that
+ * was already applied by the launch itself — is a defect, not a feature.
+ */
+const BOOT_QUIET_MS = 4000
+
+/** Absolute path of the user-facing UI preferences this plugin owns. */
+export function resolveUiSettingsPath(stateDir) {
+  return join(stateDir, 'ui-settings.json')
+}
+
+/**
+ * Read the UI preferences file (button seat + end-of-Turn prompt).
+ * @param {string} stateDir - plugin-owned state directory.
+ * @returns {{position?: string, prompt?: boolean, updatedAt?: string}|null} stored values.
+ */
+export function readUiSettings(stateDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(resolveUiSettingsPath(stateDir), 'utf8'))
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const record = {}
+    if (typeof parsed.position === 'string') {
+      const position = normalizePosition(parsed.position, '')
+      if (position !== '') record.position = position
+    }
+    if (typeof parsed.prompt === 'boolean') record.prompt = parsed.prompt
+    if (typeof parsed.updatedAt === 'string') record.updatedAt = parsed.updatedAt
+    return Object.keys(record).length === 0 ? null : record
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Merge one UI preference change into the file.
+ *
+ * The file stores only values the user changed from the settings surface; the
+ * patch row stays the baseline, so deleting the file restores the patch.
+ * @param {string} stateDir - plugin-owned state directory.
+ * @param {{position?: unknown, prompt?: unknown}} patch - changed preferences.
+ * @returns {object} the stored record after the write.
+ */
+export function writeUiSettings(stateDir, patch) {
+  const current = readUiSettings(stateDir) ?? {}
+  const next = { ...current }
+  if (patch !== null && typeof patch === 'object' && 'position' in patch) {
+    const position = normalizePosition(patch.position, '')
+    if (position !== '') next.position = position
+  }
+  if (patch !== null && typeof patch === 'object' && 'prompt' in patch) {
+    next.prompt = patch.prompt !== false
+  }
+  next.updatedAt = new Date().toISOString()
+  try {
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(resolveUiSettingsPath(stateDir), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  } catch {
+    /* a read-only state dir leaves the patch values in force */
+  }
+  return next
+}
+
+/**
+ * Resolve the effective UI settings: stored preference over patch over default.
+ * @param {object} config - resolved plugin config.
+ * @param {string} stateDir - plugin-owned state directory.
+ * @returns {{position: string, prompt: boolean, updatedAt: string|null, source: string, defaults: object}} effective settings.
+ */
+export function resolveSettings(config, stateDir) {
+  const stored = readUiSettings(stateDir) ?? {}
+  const fromFile = typeof stored.position === 'string' || typeof stored.prompt === 'boolean'
+  return {
+    position: typeof stored.position === 'string' ? stored.position : config.position,
+    prompt: typeof stored.prompt === 'boolean' ? stored.prompt : config.prompt,
+    updatedAt: typeof stored.updatedAt === 'string' ? stored.updatedAt : null,
+    source: fromFile ? 'settings' : 'config',
+    defaults: { position: DEFAULT_POSITION, prompt: true },
+  }
+}
+
+/** Absolute path of the restart-pending marker. */
+export function resolvePendingPath(stateDir) {
+  return join(stateDir, 'pending-restart.json')
+}
+
+/**
+ * Read the restart-pending marker.
+ * @param {string} stateDir - plugin-owned state directory.
+ * @returns {object|null} the record, or null when there is none (or it is unreadable).
+ */
+export function readPending(stateDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(resolvePendingPath(stateDir), 'utf8'))
+    if (typeof parsed !== 'object' || parsed === null) return null
+    if (typeof parsed.at !== 'string' || typeof parsed.atMs !== 'number') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Record that the profile's plugin set changed, so the end-of-Turn prompt has
+ * something to offer.
+ *
+ * The writer's pid is stored because the marker answers one question — "was this
+ * change applied by a restart?" A marker written by a process that is gone has
+ * already been honoured; a marker written by THIS process has not.
+ * @param {string} stateDir - plugin-owned state directory.
+ * @param {{reason?: string, source?: string}} [detail] - what happened.
+ * @returns {object|null} the record written, or null when the write failed.
+ */
+export function recordPending(stateDir, detail = {}) {
+  const now = new Date()
+  const record = {
+    schemaVersion: 1,
+    at: now.toISOString(),
+    atMs: now.getTime(),
+    pid: process.pid,
+    reason: typeof detail.reason === 'string' ? detail.reason : 'change',
+    source: typeof detail.source === 'string' ? detail.source : 'plugin-manager',
+    count: 1,
+    dismissedAt: null,
+  }
+  try {
+    const previous = readPending(stateDir)
+    if (previous !== null && now.getTime() - Number(previous.atMs) < PENDING_MERGE_MS) {
+      // A manager operation announces itself several times (install-state, then
+      // changed). One change keeps ONE timestamp, so the prompt is dated from
+      // when the user's change landed rather than from the last announcement.
+      record.at = previous.at
+      record.atMs = previous.atMs
+      record.count = (Number(previous.count) || 1) + 1
+    }
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(resolvePendingPath(stateDir), `${JSON.stringify(record, null, 2)}\n`, 'utf8')
+    return record
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Remove the marker (a restart has been honoured, or the prompt is dismissed for good).
+ * @param {string} stateDir - plugin-owned state directory.
+ */
+export function clearPending(stateDir) {
+  try {
+    rmSync(resolvePendingPath(stateDir), { force: true })
+  } catch {
+    /* nothing to clear */
+  }
+}
+
+/**
+ * Mark the current marker as seen, leaving it in place for diagnostics.
+ * @param {string} stateDir - plugin-owned state directory.
+ * @returns {object|null} the updated record.
+ */
+export function dismissPending(stateDir) {
+  const current = readPending(stateDir)
+  if (current === null) return null
+  const next = { ...current, dismissedAt: new Date().toISOString() }
+  try {
+    writeFileSync(resolvePendingPath(stateDir), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  } catch {
+    return current
+  }
+  return next
+}
+
+/**
+ * The marker the prompt may act on: null once dismissed.
+ * @param {string} stateDir - plugin-owned state directory.
+ * @returns {object|null} the visible record.
+ */
+export function visiblePending(stateDir) {
+  const current = readPending(stateDir)
+  if (current === null) return null
+  if (typeof current.dismissedAt === 'string' && current.dismissedAt !== '') return null
+  return current
+}
+
+/** How often the loaded Host entry modules are stamped again. */
+const MODULE_WATCH_MS = 3000
+
+/**
+ * The Host module files this generation actually loaded.
+ *
+ * Why this exists: a manager operation announces itself, but rebuilding a
+ * `link:`-installed plugin does not — the file under its entry changes while the
+ * Host keeps the generation it booted with. That is the exact case this plugin
+ * was built for, so the entry modules are stamped instead of guessed.
+ *
+ * Only each entry's own module file is watched: the browser half hot-reloads and
+ * needs no restart, so watching whole package directories would report changes
+ * that a restart cannot improve.
+ * @param {object} ctx - Host plugin context.
+ * @returns {string[]} absolute module paths, possibly empty.
+ */
+export function collectHostModules(ctx) {
+  let loader
+  try {
+    loader = ctx?.get?.('loader')
+  } catch {
+    return []
+  }
+  if (loader === undefined || loader === null) return []
+  const files = new Set()
+  try {
+    const entries = typeof loader.entries === 'function' ? [...loader.entries()] : []
+    for (const entry of entries) {
+      const options = entry?.options ?? entry?.subtree?.options
+      const filename = typeof options?.filename === 'string' ? options.filename : undefined
+      // Files inside the packaged asar are not ordinary paths; stat fails there
+      // consistently, which is exactly "never changes".
+      if (filename !== undefined && filename !== '') files.add(filename)
+    }
+  } catch {
+    return []
+  }
+  return [...files]
+}
+
+/**
+ * Stamp the given files as `mtimeMs:size`.
+ * @param {string[]} files - absolute module paths.
+ * @returns {Map<string, string>} one stamp per path; `missing` when unreadable.
+ */
+export function snapshotModuleStamps(files) {
+  const stamps = new Map()
+  for (const file of files) {
+    try {
+      const stat = statSync(file)
+      stamps.set(file, `${String(stat.mtimeMs)}:${String(stat.size)}`)
+    } catch {
+      stamps.set(file, 'missing')
+    }
+  }
+  return stamps
+}
+
+/**
+ * Report the first file whose stamp moved since the previous snapshot, updating
+ * the baseline as it goes. One change per tick is enough to raise the prompt.
+ * @param {Map<string, string>} baseline - stamps from the previous tick.
+ * @returns {string|null} the changed path.
+ */
+export function takeModuleChange(baseline) {
+  const current = snapshotModuleStamps([...baseline.keys()])
+  let changed = null
+  for (const [file, stamp] of current) {
+    if (baseline.get(file) === stamp) continue
+    baseline.set(file, stamp)
+    if (changed === null) changed = file
+  }
+  return changed
 }
 
 /** Absolute path of a Node executable able to run the supervisor. */
@@ -596,6 +927,9 @@ export function resolveConfig(raw, env = process.env) {
     graceMs: clampNumber(raw?.graceMs, 250, 30000, DEFAULT_GRACE_MS),
     dryRun: raw?.dryRun === true,
     relaunch: raw?.relaunch !== false,
+    position: normalizePosition(raw?.position),
+    prompt: raw?.prompt !== false,
+    watchModules: raw?.watchModules !== false,
     trayTriggerPath: typeof raw?.trayTriggerPath === 'string' ? raw.trayTriggerPath : '',
     supervisorPath: typeof raw?.supervisorPath === 'string' ? raw.supervisorPath : '',
     loaderPackageDir: typeof raw?.loaderPackageDir === 'string' ? raw.loaderPackageDir : '',
@@ -615,6 +949,34 @@ export function apply(ctx, rawConfig) {
   const supervisor = resolveSupervisorScript(config.supervisorPath, loaderPackageDir)
   /** Armed restart timers, so a teardown cancels a restart that has not fired. */
   const pending = new Set()
+  /** This Host generation's start, used to tell a startup reconcile from a change. */
+  const bootAt = Date.now()
+  /** Host entry modules stamped by the rebuild watcher (empty when disabled). */
+  let watchedModules = []
+
+  // A marker written by a process that no longer exists has already been
+  // honoured by the launch that replaced it. A marker written by THIS process
+  // (a reload, not a restart) still describes a change nothing has applied.
+  const stale = readPending(config.stateDir)
+  if (stale !== null && stale.pid !== process.pid) clearPending(config.stateDir)
+
+  /**
+   * Current UI settings, read on every answer so a settings write is visible to
+   * the browser immediately (the file is tiny; there is no cache to invalidate).
+   * @returns {object} effective settings.
+   */
+  const settings = () => resolveSettings(config, config.stateDir)
+
+  /** The shared body of every answer that carries settings and the pending marker. */
+  const stateValue = () => ({
+    settings: settings(),
+    pending: visiblePending(config.stateDir),
+    enabled: config.enabled,
+    dryRun: config.dryRun,
+    relaunch: config.relaunch,
+    positions: POSITIONS,
+    watchedModules: watchedModules.length,
+  })
 
   const guard = (req, res) => {
     if (!isTrustedRequest(req)) {
@@ -655,8 +1017,44 @@ export function apply(ctx, rawConfig) {
         commandLine: plan.commandLine,
         lastResult: readLastRestartResult(config.stateDir),
         detectionError: plan.detection.detectionError,
+        ...stateValue(),
+        pendingPath: resolvePendingPath(config.stateDir),
+        settingsPath: resolveUiSettingsPath(config.stateDir),
       },
     })
+  }
+
+  /**
+   * Cheap read of the two things a live page polls: the seat/prompt settings and
+   * whether a restart is pending. Deliberately no process detection — the prompt
+   * runs on every completed Turn, and `/status` costs a PowerShell round trip.
+   */
+  const stateHandler = async (req, res) => {
+    if (!guard(req, res)) return
+    writeJson(res, 200, { ok: true, value: stateValue() })
+  }
+
+  /** Read (empty body) or change the UI settings; answers with the same shape. */
+  const settingsHandler = async (req, res) => {
+    if (!guard(req, res)) return
+    const body = (await readJsonBody(req)) ?? {}
+    const patch = {}
+    // Only well-typed values reach the file: a stringly-typed patch from a script
+    // must not silently turn the prompt off (or the seat into junk).
+    if (Object.prototype.hasOwnProperty.call(body, 'position') && typeof body.position === 'string') patch.position = body.position
+    if (Object.prototype.hasOwnProperty.call(body, 'prompt') && typeof body.prompt === 'boolean') patch.prompt = body.prompt
+    if (Object.keys(patch).length > 0) {
+      const stored = writeUiSettings(config.stateDir, patch)
+      ctx.logger?.info?.('dsh-plugin-restart: UI settings saved (%s)', JSON.stringify(stored))
+    }
+    writeJson(res, 200, { ok: true, value: stateValue() })
+  }
+
+  /** "Later": hide the end-of-Turn prompt until the next change. */
+  const dismissHandler = async (req, res) => {
+    if (!guard(req, res)) return
+    dismissPending(config.stateDir)
+    writeJson(res, 200, { ok: true, value: stateValue() })
   }
 
   const restartHandler = async (req, res) => {
@@ -765,9 +1163,85 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  /**
+   * Listen for the two signals that mean "the plugin/profile set changed".
+   *
+   * `plugin-manager/changed` is a manager operation that completed in THIS
+   * process (the Plugins page, a bundled activation). `app-boot/config-reload`
+   * is the patch generation a CLI or a hand edit produced, reconciled by the
+   * watcher — which announces nothing on the manager event. Both are recorded,
+   * and neither is reported as "applied": a restart is what applies them.
+   */
+  const listeners = []
+  const listen = (event, handler) => {
+    if (typeof ctx.on !== 'function') return
+    try {
+      const off = ctx.on(event, (payload) => {
+        try {
+          handler(payload)
+        } catch (error) {
+          ctx.logger?.warn?.('dsh-plugin-restart: pending marker failed (%s)', error instanceof Error ? error.message : String(error))
+        }
+      })
+      if (typeof off === 'function') listeners.push(off)
+    } catch {
+      /* an event this Host does not publish is not an error */
+    }
+  }
+  if (config.prompt) {
+    listen('plugin-manager/changed', (change) => {
+      recordPending(config.stateDir, { source: 'plugin-manager', reason: change?.reason ?? 'plugin' })
+    })
+    listen('plugin-manager/install-state', (progress) => {
+      if (progress?.phase === 'applying') recordPending(config.stateDir, { source: 'install', reason: 'install' })
+    })
+    listen('app-boot/config-reload', () => {
+      // The startup reconcile runs once the Loader tree is up and is not a user
+      // change; only a reload after the quiet window is.
+      if (Date.now() - bootAt < BOOT_QUIET_MS) return
+      recordPending(config.stateDir, { source: 'config-reload', reason: 'config-reload' })
+    })
+  }
+  for (const off of listeners) {
+    if (typeof ctx.effect === 'function') ctx.effect(() => off, 'dsh-plugin-restart: change listener')
+  }
+
+  /**
+   * Catch the change DSH does not announce: a rebuilt `link:`-installed plugin.
+   *
+   * The manager reports installs and toggles, and the watcher reports patch
+   * generations — but rewriting the Host half of a linked plugin in place moves
+   * no patch file and raises no event. Stamping the loaded entry modules is the
+   * only signal that covers it, and it is also the signal a restart can actually
+   * fix (the browser half hot-reloads on its own and is deliberately not watched).
+   */
+  if (config.prompt && config.watchModules) {
+    watchedModules = collectHostModules(ctx)
+    if (watchedModules.length > 0) {
+      const baseline = snapshotModuleStamps(watchedModules)
+      const handle = setInterval(() => {
+        try {
+          const changed = takeModuleChange(baseline)
+          if (changed === null) return
+          recordPending(config.stateDir, { source: 'module-watch', reason: 'host-module' })
+          ctx.logger?.info?.('dsh-plugin-restart: Host module changed (%s); restart pending', changed)
+        } catch (error) {
+          ctx.logger?.warn?.('dsh-plugin-restart: module watch failed (%s)', error instanceof Error ? error.message : String(error))
+        }
+      }, MODULE_WATCH_MS)
+      if (typeof handle.unref === 'function') handle.unref()
+      if (typeof ctx.effect === 'function') {
+        ctx.effect(() => () => clearInterval(handle), 'dsh-plugin-restart: module watch')
+      }
+    }
+  }
+
   const disposers = [
     ctx.webServer.register({ kind: 'exact', path: `${ROUTE_PREFIX}/status`, handler: statusHandler }),
     ctx.webServer.register({ kind: 'exact', path: `${ROUTE_PREFIX}/restart`, handler: restartHandler }),
+    ctx.webServer.register({ kind: 'exact', path: `${ROUTE_PREFIX}/state`, handler: stateHandler }),
+    ctx.webServer.register({ kind: 'exact', path: `${ROUTE_PREFIX}/settings`, handler: settingsHandler }),
+    ctx.webServer.register({ kind: 'exact', path: `${ROUTE_PREFIX}/dismiss`, handler: dismissHandler }),
   ]
   for (const dispose of disposers) {
     if (typeof ctx.effect === 'function') ctx.effect(() => dispose, 'dsh-plugin-restart: restart route')

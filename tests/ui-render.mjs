@@ -182,14 +182,20 @@ function findHost(node, predicate, out = []) {
 
 /* ------------------------------------------------------------------ loading */
 
-function loadBundle(file, stub) {
+function loadBundle(file, stub, options = {}) {
   const source = readFileSync(file, 'utf8')
   const registered = []
+  const fetchCalls = []
+  const defaultFetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, value: {} }), text: async () => '' })
+  const fetchImpl = typeof options.fetch === 'function' ? options.fetch : defaultFetch
   const sandbox = {
     console,
     setTimeout, clearTimeout, queueMicrotask,
     setInterval: () => 0, clearInterval: () => {},
-    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, value: {} }), text: async () => '' }),
+    fetch: (...args) => {
+      fetchCalls.push(args[0])
+      return fetchImpl(...args)
+    },
     AbortController, URL, URLSearchParams, TextEncoder, TextDecoder,
     JSON, Date, Math, Number, String, Boolean, Array, Object, Error, TypeError, Promise, RegExp, Symbol, Map, Set, Intl, WeakMap, WeakSet,
     document: stub.documentStub,
@@ -256,7 +262,7 @@ function loadBundle(file, stub) {
     },
   }
   module.apply(ctx)
-  return { registered, translate, source, dictionaries }
+  return { registered, translate, source, dictionaries, fetchCalls }
 }
 
 async function renderComponent(stub, component, props) {
@@ -292,9 +298,26 @@ const { registered, translate, source } = loaded
 const slots = registered.map((entry) => entry.meta?.name)
 const entry = registered.find((row) => row.meta?.name === 'sidebar.footer.action')
 
-check('registers one sidebar.footer.action entry', Boolean(entry), 'slots=' + JSON.stringify(slots))
-check('the entry keeps the stable id and the low order', entry?.meta?.id === 'dsh-restart' && entry?.meta?.order === 10,
+const EXPECTED_SEATS = [
+  'sidebar.footer.action',
+  'conversation.session.header.utilities',
+  'conversation.input.right',
+  'conversation.composer.dock',
+  'conversation.chat.turnTail',
+  'plugins.detail.section',
+]
+check('registers every preset seat, the turn tail and the settings section',
+  EXPECTED_SEATS.every((name) => slots.includes(name)) && slots.length === EXPECTED_SEATS.length,
+  'slots=' + JSON.stringify(slots))
+check('the sidebar entry keeps the stable id and the low order', entry?.meta?.id === 'dsh-restart' && entry?.meta?.order === 10,
   `id=${String(entry?.meta?.id)} order=${String(entry?.meta?.order)}`)
+check('every trigger seat carries its own seat name',
+  ['sidebar.footer.action', 'conversation.session.header.utilities', 'conversation.input.right', 'conversation.composer.dock']
+    .every((name) => {
+      const row = registered.find((candidate) => candidate.meta?.name === name)
+      return typeof row?.meta?.inject === 'function' && typeof row.meta.inject().seat === 'string'
+    }),
+  'seat props')
 
 const injected = typeof entry?.meta?.inject === 'function' ? entry.meta.inject() : {}
 const closed = await renderComponent(stub, entry.component, { wide: true, ...injected })
@@ -346,6 +369,7 @@ check('open: the note lives inside the panel, beside the question',
 const noteRule = /\.dshr-note \{[^}]*\}/.exec(source)?.[0] ?? ''
 const titleRule = /\.dshr-title \{[^}]*\}/.exec(source)?.[0] ?? ''
 const panelRule = /\.dshr-panel \{[^}]*\}/.exec(source)?.[0] ?? ''
+const footerSeatRule = /\.dshr-anchor\[data-seat="sidebar-footer"\] \.dshr-panel \{[^}]*\}/.exec(source)?.[0] ?? ''
 
 check('css: the note is not bold', /font-weight:\s*400/.test(noteRule) && !/font-weight:\s*[5-9]00/.test(noteRule), noteRule.trim())
 check('css: the note is de-emphasised with the tertiary label colour',
@@ -354,19 +378,124 @@ check('css: the note is smaller than the question', /font-size:\s*12px/.test(not
   `note: ${noteRule.trim()} | title: ${titleRule.trim()}`)
 check('css: the question keeps the title weight', /font-weight:\s*600/.test(titleRule), titleRule.trim())
 
-check('css: the panel is anchored to the trigger inside the sidebar column',
-  /position:\s*absolute/.test(panelRule) && /left:\s*0/.test(panelRule) && /bottom:\s*calc\(100% \+ 6px\)/.test(panelRule),
+check('css: the panel is anchored to the trigger in every seat',
+  /position:\s*absolute/.test(panelRule) && /z-index/.test(panelRule),
   panelRule.replace(/\s+/g, ' ').trim().slice(0, 120))
+check('css: the sidebar seat keeps the column-inset anchor',
+  /position:\s*absolute/.test(footerSeatRule) && /left:\s*0/.test(footerSeatRule) && /bottom:\s*calc\(100% \+ 6px\)/.test(footerSeatRule),
+  footerSeatRule.replace(/\s+/g, ' ').trim().slice(0, 120))
+check('css: the header seat opens downward and the composer seats upward',
+  /data-seat="session-header"\] \.dshr-panel \{[^}]*top:\s*calc\(100% \+ 8px\)/.test(source)
+    && /data-seat="composer-input"\] \.dshr-panel,[\s\S]{0,120}bottom:\s*calc\(100% \+ 8px\)/.test(source),
+  'per-seat anchoring')
 check('css: no viewport-corner window remains',
   !/position:\s*fixed;\s*left:\s*8px/.test(source) && !/width:\s*320px/.test(source))
 check('css: the width is the sidebar content column, from the frame\'s own variables',
-  panelRule.includes('--dsh-windows-sidebar-width') && panelRule.includes('--dsh-sidebar-inline-padding'),
+  footerSeatRule.includes('--dsh-windows-sidebar-width') && footerSeatRule.includes('--dsh-sidebar-inline-padding'),
   'sidebar-width + inline-padding')
 check('css: still no rect maths', !source.includes('getBoundingClientRect'))
 check('css: theme tokens only, no literal colours', (() => {
   const colors = [...source.matchAll(/#[0-9a-fA-F]{3,8}\b/g)].map((m) => m[0]).filter((c) => c !== '#fff')
   return colors.length === 0
 })())
+
+/* ------------------------------------------------- the seat is a preference */
+
+const headerEntry = registered.find((row) => row.meta?.name === 'conversation.session.header.utilities')
+if (headerEntry === undefined) {
+  check('a seat that is not configured renders nothing (no duplicate buttons)', false, 'the header seat is not registered')
+} else {
+  const headerInjected = typeof headerEntry.meta.inject === 'function' ? headerEntry.meta.inject() : {}
+  const inactiveSeat = await renderComponent(stub, headerEntry.component, { wide: true, ...headerInjected })
+  check('a seat that is not configured renders nothing (no duplicate buttons)',
+    inactiveSeat === null,
+    'tree=' + JSON.stringify(inactiveSeat === null))
+}
+check('every seat still registers, so switching needs no re-register',
+  registered.filter((row) => row.meta?.id === 'dsh-restart').length === 4,
+  'trigger registrations=' + String(registered.filter((row) => row.meta?.id === 'dsh-restart').length))
+
+/* ------------------------------------------------ the end-of-Turn prompt */
+
+/** One Host-shaped pending marker, stamped now. */
+const pendingRecordFactory = () => {
+  const at = Date.now()
+  return { schemaVersion: 1, at: new Date(at).toISOString(), atMs: at, pid: 424242, reason: 'install', source: 'plugin-manager', count: 1, dismissedAt: null }
+}
+
+const pendingStub = createStub()
+const pendingLoad = loadBundle(bundlePath, pendingStub, {
+  fetch: async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ ok: true, value: { settings: { position: 'sidebar-footer', prompt: true }, pending: pendingRecordFactory(), enabled: true } }),
+    text: async () => '',
+  }),
+})
+const promptEntry = pendingLoad.registered.find((row) => row.meta?.name === 'conversation.chat.turnTail')
+const settingsEntry = pendingLoad.registered.find((row) => row.meta?.name === 'plugins.detail.section')
+
+if (promptEntry === undefined) {
+  check('prompt: the completed-Turn tail seat is registered', false, 'no turn-tail entry in this bundle')
+} else {
+  const promptInjected = typeof promptEntry.meta.inject === 'function' ? promptEntry.meta.inject() : {}
+  const latestChat = { timeline: { turnOrder: [{ turn: 1 }, { turn: 7 }] } }
+  const promptTree = await renderComponent(pendingStub, promptEntry.component, {
+    turn: { turn: 7 },
+    useChat: (selector) => selector(latestChat),
+    ...promptInjected,
+  })
+  const promptRoot = findHost(promptTree, (node) => String(node.props?.className) === 'dshr-prompt')
+  check('prompt: a pending change renders at the end of the reply', promptRoot.length === 1, 'prompt=' + String(promptRoot.length))
+  check('prompt: it asks one question with two answers',
+    textOf(promptTree).includes('插件已更新，重启后生效')
+      && findHost(promptTree, (node) => node.$$host === 'button').map(textOf).join('|') === '稍后|立即重启',
+    JSON.stringify(findHost(promptTree, (node) => node.$$host === 'button').map(textOf)))
+  check('prompt: the prompt is not a document heading',
+    findHost(promptTree, (node) => typeof node.$$host === 'string' && /^h[1-6]$/.test(node.$$host)).length === 0)
+
+  const olderChat = { timeline: { turnOrder: [{ turn: 7 }, { turn: 8 }] } }
+  const olderTree = await renderComponent(pendingStub, promptEntry.component, {
+    turn: { turn: 7 },
+    useChat: (selector) => selector(olderChat),
+    ...promptInjected,
+  })
+  check('prompt: an older Turn never repaints the prompt', olderTree === null, 'history stays clean')
+
+  /* ------------------------------- the prompt dismisses without restarting */
+
+  const dismissButton = findHost(promptTree, (node) => node.$$host === 'button' && textOf(node) === '稍后')[0]
+  if (typeof dismissButton?.props?.onClick === 'function') dismissButton.props.onClick()
+  await new Promise((resolve) => { setTimeout(resolve, 10) })
+  check('prompt: “Later” posts the dismissal instead of restarting',
+    pendingLoad.fetchCalls.some((url) => String(url).includes('/api/dsh-restart/dismiss')),
+    'calls=' + JSON.stringify(pendingLoad.fetchCalls.filter((url) => String(url).includes('/api/'))))
+}
+
+/* -------------------------------------- the settings section on the page */
+
+if (settingsEntry === undefined) {
+  check('settings: the plugin’s own page section is registered', false, 'no plugins.detail.section entry')
+} else {
+  const settingsInjected = typeof settingsEntry.meta.inject === 'function' ? settingsEntry.meta.inject() : {}
+  const foreignTree = await renderComponent(pendingStub, settingsEntry.component, {
+    subject: { kind: 'bundle', pkg: { name: 'someone-else', rows: [] } },
+    ...settingsInjected,
+  })
+  check('settings: nothing is drawn on another plugin’s page', foreignTree === null, 'subject gate')
+  const ownTree = await renderComponent(pendingStub, settingsEntry.component, {
+    subject: { kind: 'bundle', pkg: { name: 'dsh-plugin-restart', rows: [] } },
+    ...settingsInjected,
+  })
+  const radios = findHost(ownTree, (node) => node.$$host === 'input' && node.props?.type === 'radio')
+  check('settings: all five seat presets are offered', radios.length === 5,
+    'radios=' + JSON.stringify(radios.map((node) => node.props?.value)))
+  check('settings: the active seat is checked', radios.filter((node) => node.props?.checked).length === 1
+    && radios.find((node) => node.props?.checked)?.props?.value === 'sidebar-footer',
+    'checked=' + JSON.stringify(radios.filter((node) => node.props?.checked).map((node) => node.props?.value)))
+  check('settings: the end-of-reply prompt has its own switch',
+    findHost(ownTree, (node) => node.$$host === 'input' && node.props?.type === 'checkbox').length === 1)
+}
 
 /* ------------------------------------------------------------------ verdict */
 

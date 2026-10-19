@@ -1,6 +1,6 @@
 {
   "meta.title": "一键重启 DSH",
-  "meta.description": "侧边栏底部按钮 + 可选的脱离进程守护：重启整个 DeepSeek Harness 应用与 Host，让刚重建的插件与组合立即生效。",
+  "meta.description": "可换位置的重启按钮 + 回复末尾的自动提示 + 可选的脱离进程守护：重启整个 DeepSeek Harness 应用与 Host，让刚重建的插件与组合立即生效。",
   "action.label": "重启 DSH",
   "action.title": "重启 DSH（应用与 Host）",
   "dialog.title": "重启 DSH",
@@ -16,5 +16,24 @@
   "state.hostGone": "无法连接 Host；若应用已退出，请手动重新打开。",
   "state.failed": "重启请求失败：{reason}",
   "state.timeout": "请求超时，未确认重启。",
-  "status.failed": "状态请求失败（HTTP {status}）"
+  "status.failed": "状态请求失败（HTTP {status}）",
+  "prompt.title": "插件已更新，重启后生效",
+  "prompt.note": "重启会关闭并重新拉起整个应用，本页随后自动重连。",
+  "prompt.later": "稍后",
+  "prompt.restart": "立即重启",
+  "settings.title": "重启按钮位置",
+  "settings.note": "改完立即生效，不需要重启。",
+  "settings.prompt": "安装或更新插件后，在回复末尾提示重启",
+  "settings.saved": "已保存",
+  "settings.failed": "保存失败，请稍后重试。",
+  "position.sidebar-footer": "侧栏页脚",
+  "position.sidebar-footer.hint": "左下角、设置按钮旁（默认）",
+  "position.session-header": "会话标题栏",
+  "position.session-header.hint": "会话标题右侧的工具区",
+  "position.composer-input": "输入框工具行",
+  "position.composer-input.hint": "发送按钮左侧的紧凑控制区",
+  "position.composer-dock": "输入框下方",
+  "position.composer-dock.hint": "输入框卡片下方的环境条目区",
+  "position.off": "不显示按钮",
+  "position.off.hint": "只保留回复末尾的提示与本页设置"
 }

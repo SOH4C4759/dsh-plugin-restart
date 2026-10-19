@@ -6,7 +6,8 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -150,6 +151,112 @@ await check('config clamping tolerates junk values', () => {
   return JSON.stringify({ armDelayMs: config.armDelayMs, graceMs: config.graceMs })
 })
 
+await check('the seat is a clamped preset, not a free string', () => {
+  assert.deepEqual(host.POSITIONS, ['sidebar-footer', 'session-header', 'composer-input', 'composer-dock', 'off'])
+  assert.equal(host.DEFAULT_POSITION, 'sidebar-footer')
+  // Case, whitespace and the historical names all land on a real seat.
+  assert.equal(host.resolveConfig({ position: 'HEADER ' }).position, 'session-header')
+  assert.equal(host.resolveConfig({ position: 'sidebar' }).position, 'sidebar-footer')
+  assert.equal(host.resolveConfig({ position: 'hidden' }).position, 'off')
+  // A typo must not make the button disappear.
+  assert.equal(host.resolveConfig({ position: 'nowhere' }).position, 'sidebar-footer')
+  assert.equal(host.resolveConfig({}).prompt, true)
+  assert.equal(host.resolveConfig({ prompt: false }).prompt, false)
+  return '4 seats + off, typo-safe'
+})
+
+await check('UI settings override the patch and never corrupt it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-restart-settings-'))
+  try {
+    const config = host.resolveConfig({ position: 'composer-dock', prompt: false })
+    const baseline = host.resolveSettings(config, dir)
+    assert.equal(baseline.position, 'composer-dock')
+    assert.equal(baseline.prompt, false)
+    assert.equal(baseline.source, 'config')
+
+    host.writeUiSettings(dir, { position: 'session-header' })
+    const stored = host.resolveSettings(config, dir)
+    assert.equal(stored.position, 'session-header')
+    assert.equal(stored.source, 'settings')
+    // Only the changed key is overridden; the patch keeps the rest.
+    assert.equal(stored.prompt, false, 'the untouched prompt keeps the patch value')
+
+    host.writeUiSettings(dir, { position: 'not-a-seat' })
+    assert.equal(host.resolveSettings(config, dir).position, 'session-header', 'an invalid seat is ignored')
+
+    host.writeUiSettings(dir, { prompt: true })
+    assert.equal(host.resolveSettings(config, dir).prompt, true)
+    return 'patch < settings file < defaults'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('the pending marker survives a dismissal and re-opens on the next change', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-restart-pending-'))
+  try {
+    const record = host.recordPending(dir, { reason: 'install', source: 'plugin-manager' })
+    assert.equal(record.reason, 'install')
+    assert.equal(record.pid, process.pid, 'the writer pid is what tells a restart apart from a reload')
+    assert.equal(host.visiblePending(dir).reason, 'install')
+
+    host.dismissPending(dir)
+    assert.equal(host.visiblePending(dir), null, 'a dismissed prompt is hidden')
+    assert.equal(host.readPending(dir).reason, 'install', 'the record stays for diagnostics')
+
+    host.recordPending(dir, { reason: 'bundle' })
+    assert.equal(host.visiblePending(dir).reason, 'bundle', 'the next change re-opens the prompt')
+
+    host.clearPending(dir)
+    assert.equal(host.readPending(dir), null)
+    return 'record -> visible -> dismissed -> re-recorded -> cleared'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('the rebuilt-Host-module watcher detects a rewrite', async () => {
+  // The one change DSH does not announce: rewriting a linked plugin's Host half
+  // in place. Stamp-then-compare is the whole mechanism, so it is tested on a
+  // real file rather than a mock.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-restart-watch-'))
+  try {
+    const file = join(dir, 'index.js')
+    writeFileSync(file, 'export const version = 1\n', 'utf8')
+    const baseline = host.snapshotModuleStamps([file])
+    assert.equal(host.takeModuleChange(baseline), null, 'an untouched file reports no change')
+    // Two writes can land inside one filesystem timestamp tick; the size part of
+    // the stamp is what keeps this deterministic.
+    writeFileSync(file, 'export const version = 2 // rebuilt\n', 'utf8')
+    assert.equal(host.takeModuleChange(baseline), file, 'a rewrite is reported once')
+    assert.equal(host.takeModuleChange(baseline), null, 'the baseline moved with the report')
+    assert.equal(host.snapshotModuleStamps([join(dir, 'missing.js')]).get(join(dir, 'missing.js')), 'missing')
+    assert.equal(host.resolveConfig({ watchModules: false }).watchModules, false)
+    assert.equal(host.resolveConfig({}).watchModules, true)
+    assert.deepEqual(host.collectHostModules({ get: () => undefined }), [], 'a Host without a Loader watches nothing')
+    const source = readFileSync(join(packageRoot, 'index.js'), 'utf8')
+    assert.ok(source.includes('unref'), 'the watcher must not keep the Host alive')
+    assert.ok(source.includes('module-watch'), 'the marker must name its source')
+    return 'stamp -> rewrite -> one report'
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('the host listens to the three real change signals', () => {
+  const source = readFileSync(join(packageRoot, 'index.js'), 'utf8')
+  for (const event of ['plugin-manager/changed', 'plugin-manager/install-state', 'app-boot/config-reload']) {
+    assert.ok(source.includes(event), `the host must listen to ${event}`)
+  }
+  // `applying` is the phase that means "files are in place"; the earlier phases
+  // describe a download, not a change the user has finished making.
+  assert.ok(source.includes("progress?.phase === 'applying'"), 'only the applying phase records a change')
+  // The startup reconcile must not be mistaken for a user change.
+  assert.ok(source.includes('BOOT_QUIET_MS'), 'the boot quiet window must guard config-reload')
+  assert.ok(source.includes('stale.pid !== process.pid'), 'a marker from a dead process is cleared at boot')
+  return 'changed + install/applying + config-reload'
+})
+
 await check('plan contract matches what the supervisor reads', async () => {
   // The Host passes the plan to the PowerShell supervisor as command-line
   // parameters. Drift between the two sides is silent at build time and fatal at
@@ -177,17 +284,27 @@ await check('plan contract matches what the supervisor reads', async () => {
   return `${declared.join(', ')} -> ${argv.join(' ')}`
 })
 
-await check('client half registers the sidebar footer action and posts to the host', () => {
+await check('client half registers the preset seats and posts to the host', () => {
   const source = readFileSync(join(packageRoot, 'client.js'), 'utf8')
   assert.ok(source.includes("id: 'dsh-plugin-restart'"))
-  // The button lives at the sidebar foot, beside the account launcher.
-  assert.ok(source.includes("sidebar.footer.action"), 'the action must register into the sidebar footer')
-  assert.ok(!/slots\.inject\('conversation\.session\.header\.actions'/.test(source), 'it must no longer register into the session header')
-  assert.ok(source.includes('RestartGlyph'), 'the compact footer button needs an icon')
+  // The trigger lives at the sidebar foot by default, beside the account launcher.
+  assert.ok(source.includes("'sidebar.footer.action'"), 'the default seat must stay the sidebar footer')
+  assert.ok(!/slots\.inject\('conversation\.session\.header\.actions'/.test(source), 'it must not register into the session title row')
+  // The other presets, the end-of-Turn prompt and the plugin's own settings page.
+  for (const seat of ['conversation.session.header.utilities', 'conversation.input.right', 'conversation.composer.dock']) {
+    assert.ok(source.includes(`'${seat}'`), `the preset seat ${seat} must be registered`)
+  }
+  assert.ok(source.includes("'conversation.chat.turnTail'"), 'the prompt must use the completed-Turn tail seat')
+  assert.ok(source.includes("'plugins.detail.section'"), 'the settings page section must be registered')
+  // The prompt is scoped to the last Turn, so history is not repainted.
+  assert.ok(source.includes('timeline?.turnOrder'), 'the prompt must compare against the timeline')
+  assert.ok(source.includes('useChat'), 'the last-Turn check must use the slot standard prop')
+  assert.ok(source.includes('RestartGlyph'), 'the compact button needs an icon')
   assert.ok(!/props\?\.wide/.test(source), 'the button must stay icon-only, with no text label')
   assert.ok(source.includes('action.title'), 'the icon needs an accessible name and tooltip')
-  assert.ok(source.includes("'/api/dsh-restart/restart'"))
-  assert.ok(source.includes("'/api/dsh-restart/status'"))
+  for (const route of ['/api/dsh-restart/restart', '/api/dsh-restart/status', '/api/dsh-restart/state', '/api/dsh-restart/settings', '/api/dsh-restart/dismiss']) {
+    assert.ok(source.includes(`'${route}'`), `the browser half must call ${route}`)
+  }
   assert.ok(source.includes('window.__ModuleLoader__.load'))
   assert.ok(!source.includes('dsh-client-ui-primitives'), 'must not import host client packages')
   return `${source.split('\n').length} lines`

@@ -1,6 +1,6 @@
 {
   "meta.title": "One-click DSH restart",
-  "meta.description": "Sidebar-footer button plus an optional detached supervisor: restarts the whole DeepSeek Harness app and Host, so a rebuilt plugin or composition takes effect immediately.",
+  "meta.description": "A restart button that can live in several seats, an automatic end-of-reply prompt, and an optional detached supervisor: restarts the whole DeepSeek Harness app and Host, so a rebuilt plugin or composition takes effect immediately.",
   "action.label": "Restart DSH",
   "action.title": "Restart DSH (app and Host)",
   "dialog.title": "Restart DSH",
@@ -16,5 +16,24 @@
   "state.hostGone": "Cannot reach the Host; if the app exited, reopen it manually.",
   "state.failed": "Restart request failed: {reason}",
   "state.timeout": "The request timed out, so no restart was confirmed.",
-  "status.failed": "Status request failed (HTTP {status})"
+  "status.failed": "Status request failed (HTTP {status})",
+  "prompt.title": "Plugins changed; restart to apply",
+  "prompt.note": "Restarting closes and relaunches the whole app; this page reconnects afterwards.",
+  "prompt.later": "Later",
+  "prompt.restart": "Restart now",
+  "settings.title": "Restart button position",
+  "settings.note": "Applies immediately; no restart needed.",
+  "settings.prompt": "After a plugin change, prompt at the end of the reply",
+  "settings.saved": "Saved",
+  "settings.failed": "Could not save; try again.",
+  "position.sidebar-footer": "Sidebar footer",
+  "position.sidebar-footer.hint": "Bottom left, beside Settings (default)",
+  "position.session-header": "Session header",
+  "position.session-header.hint": "Utilities at the right of the Session title",
+  "position.composer-input": "Composer toolbar",
+  "position.composer-input.hint": "Compact controls left of Send",
+  "position.composer-dock": "Below the composer",
+  "position.composer-dock.hint": "Ambient strip under the composer card",
+  "position.off": "No button",
+  "position.off.hint": "Keep only the end-of-reply prompt and this setting"
 }

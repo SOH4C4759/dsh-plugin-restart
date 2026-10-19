@@ -95,13 +95,24 @@ mkdirSync(workDir, { recursive: true })
 try {
   // --- mounting ------------------------------------------------------------
   const routes = mount({ armDelayMs: 0, graceMs: 300 }, workDir)
-  record('both routes are mounted at their exact paths', routes.size === 2 && routes.has('/api/dsh-restart/status') && routes.has('/api/dsh-restart/restart'), [...routes.keys()].join(', '))
+  const expected = [
+    '/api/dsh-restart/status',
+    '/api/dsh-restart/restart',
+    '/api/dsh-restart/state',
+    '/api/dsh-restart/settings',
+    '/api/dsh-restart/dismiss',
+  ]
+  record('every route is mounted at its exact path', routes.size === expected.length && expected.every((path) => routes.has(path)), [...routes.keys()].join(', '))
   for (const route of routes.values()) {
     assert.equal(route.kind, 'exact')
   }
 
   const status = routes.get('/api/dsh-restart/status')
   const restart = routes.get('/api/dsh-restart/restart')
+  const state = routes.get('/api/dsh-restart/state')
+  const settings = routes.get('/api/dsh-restart/settings')
+  const dismiss = routes.get('/api/dsh-restart/dismiss')
+  const stateDir = join(workDir, 'dsh-plugin-restart')
 
   // --- status --------------------------------------------------------------
   {
@@ -111,6 +122,76 @@ try {
     record('status answers 200 with ok:true', res.statusCode === 200 && body.ok === true, `HTTP ${String(res.statusCode)}`)
     record('status reports the target and supervisor runtime', Number.isInteger(body.value?.target?.pid) && typeof body.value?.supervisorScript === 'string' && typeof body.value?.supervisorRuntime?.source === 'string', JSON.stringify({ pid: body.value?.target?.pid, source: body.value?.supervisorRuntime?.source }))
     record('status sets no-store and no-referrer', res.headers?.['cache-control'] === 'no-store' && res.headers?.['referrer-policy'] === 'no-referrer', JSON.stringify(res.headers))
+    record('status carries the seat settings and the pending marker', body.value?.settings?.position === 'sidebar-footer' && body.value?.pending === null && Array.isArray(body.value?.positions), JSON.stringify({ position: body.value?.settings?.position, pending: body.value?.pending }))
+  }
+
+  // --- state (cheap read) --------------------------------------------------
+  {
+    const res = makeRes()
+    await state.handler(makeReq({ body: '{}' }), res)
+    const body = res.json()
+    record('state answers settings + pending without a restart plan',
+      res.statusCode === 200
+        && body.value?.settings?.position === 'sidebar-footer'
+        && body.value?.settings?.prompt === true
+        && body.value?.pending === null
+        && body.value?.plan === undefined,
+      JSON.stringify(body.value?.settings))
+    record('state does not scan processes', body.value?.target === undefined, 'no target in the cheap answer')
+  }
+
+  // --- settings ------------------------------------------------------------
+  {
+    const res = makeRes()
+    await settings.handler(makeReq({ body: '{"position":"session-header"}' }), res)
+    const body = res.json()
+    record('settings writes the chosen seat and answers with it',
+      res.statusCode === 200 && body.value?.settings?.position === 'session-header' && body.value?.settings?.source === 'settings',
+      JSON.stringify(body.value?.settings))
+    const again = makeRes()
+    await state.handler(makeReq({ body: '{}' }), again)
+    record('the chosen seat survives a later read', again.json().value?.settings?.position === 'session-header', String(again.json().value?.settings?.position))
+  }
+  {
+    const res = makeRes()
+    await settings.handler(makeReq({ body: '{"position":"nonsense"}' }), res)
+    record('an unknown seat is ignored instead of unmounting the button', res.json().value?.settings?.position === 'session-header', String(res.json().value?.settings?.position))
+  }
+  {
+    const res = makeRes()
+    await settings.handler(makeReq({ body: '{"prompt":false}' }), res)
+    record('settings can switch the end-of-Turn prompt off', res.json().value?.settings?.prompt === false, JSON.stringify(res.json().value?.settings))
+    const back = makeRes()
+    await settings.handler(makeReq({ body: '{"prompt":true}' }), back)
+    record('settings can switch it back on', back.json().value?.settings?.prompt === true, JSON.stringify(back.json().value?.settings))
+  }
+
+  // --- pending marker ------------------------------------------------------
+  {
+    host.recordPending(stateDir, { reason: 'install', source: 'plugin-manager' })
+    const res = makeRes()
+    await state.handler(makeReq({ body: '{}' }), res)
+    const pending = res.json().value?.pending
+    record('a recorded change becomes a visible pending marker',
+      pending !== null && pending.reason === 'install' && Number.isInteger(pending.pid),
+      JSON.stringify({ reason: pending?.reason, pid: pending?.pid }))
+    const noScan = makeRes()
+    await status.handler(makeReq(), noScan)
+    record('status exposes the same marker', noScan.json().value?.pending?.reason === 'install', JSON.stringify(noScan.json().value?.pending?.reason))
+  }
+  {
+    const res = makeRes()
+    await dismiss.handler(makeReq({ body: '{}' }), res)
+    record('dismiss hides the prompt for this change', res.statusCode === 200 && res.json().value?.pending === null, JSON.stringify(res.json().value?.pending))
+    const again = makeRes()
+    await state.handler(makeReq({ body: '{}' }), again)
+    record('dismissal survives a later read', again.json().value?.pending === null, 'hidden')
+  }
+  {
+    host.recordPending(stateDir, { reason: 'bundle', source: 'plugin-manager' })
+    const res = makeRes()
+    await state.handler(makeReq({ body: '{}' }), res)
+    record('a NEW change re-opens the prompt after a dismissal', res.json().value?.pending?.reason === 'bundle', JSON.stringify(res.json().value?.pending?.reason))
   }
 
   // --- guards --------------------------------------------------------------
@@ -133,6 +214,11 @@ try {
     const res = makeRes()
     await restart.handler(makeReq({ method: 'GET' }), res)
     record('GET is refused with 405', res.statusCode === 405 && res.json().code === 'method-not-allowed', `HTTP ${String(res.statusCode)}`)
+  }
+  for (const [name, route] of [['state', state], ['settings', settings], ['dismiss', dismiss]]) {
+    const res = makeRes()
+    await route.handler(makeReq({ origin: 'http://evil.example' }), res)
+    record(`${name} keeps the same-origin guard`, res.statusCode === 403, `HTTP ${String(res.statusCode)}`)
   }
 
   // --- dry run -------------------------------------------------------------

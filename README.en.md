@@ -7,7 +7,9 @@
 
 After you rebuild a plugin, **click the "Restart DSH" button in the UI** and the entire DeepSeek Harness desktop app (Electron shell + Host) exits and relaunches itself, so the freshly built plugin, bundle, or preset is loaded immediately.
 
-- An **icon-only button at the sidebar foot** (`sidebar.footer.action`, `order: 10`), next to the account launcher. Hovering shows a tooltip; clicking opens a confirmation panel **inside the sidebar column** (not in the corner of the window): the question `Restart DSH`, a de-emphasised scope note `(app and Host)`, and Cancel / Restart now.
+- **The button's position is configurable** (`position`, five presets): sidebar footer (default), Session header, composer toolbar, below the composer, or no button at all. It can be set in the profile patch *and* changed straight from **Settings → Plugins → One-click DSH restart**, which applies immediately and needs no restart.
+- **An automatic prompt at the end of the reply**: when the Host sees that the plugin/bundle set changed it records a pending marker; the next reply ends with a card asking whether to restart (`Later` / `Restart now`). It uses `conversation.chat.turnTail` — DSH's native seat for "content before a completed Turn's action row" — so it reads as part of the reply, and it only renders on the **timeline's last Turn**, never across history. `Later` hides it for that change only; the next change brings it back.
+- The default seat is an **icon-only button at the sidebar foot** (`sidebar.footer.action`, `order: 10`), next to the account launcher. Hovering shows a tooltip; clicking opens a confirmation panel **inside the sidebar column** (not in the corner of the window): the question `Restart DSH`, a de-emphasised scope note `(app and Host)`, and Cancel / Restart now.
 - Optional: `tray/tray-host.ps1` puts "Restart DSH" in the Windows notification area, so a restart does not depend on the UI being reachable.
 
 This package **does not patch DSH source and does not need a fork**: it is a standard profile bundle (`dsh.bundle.patch` + `dsh.client`) that you install into your own profile.
@@ -142,10 +144,55 @@ Uninstall: `& $dsh plugin --profile desktop remove dsh-plugin-restart`.
 
 ## Usage
 
-1. Rebuild your plugin (`pnpm build` or similar).
-2. Click the restart icon at the sidebar foot → "Restart now".
+1. Rebuild your plugin (`pnpm build` or similar), or install/update a bundle from Settings → Plugins.
+2. When the next reply finishes, a prompt appears at the **end of that reply**: *Plugins changed; restart to apply* → **Restart now** (or **Later**).
+   - Alternatively click the icon in whatever seat you configured → confirmation panel → Restart now.
 3. The app exits and comes back; the page reconnects and you can continue the same session.
 4. If it does not come back, read `%USERPROFILE%\.dsh\dsh-plugin-restart\restart.log` and `restart-result.json` — both record every supervisor step.
+
+### The end-of-reply prompt (when it appears)
+
+The Host listens to four signals: three DSH publishes itself, plus the timestamps of the Host entry modules it actually loaded. It never guesses from file contents:
+
+| Signal | Meaning |
+|---|---|
+| `plugin-manager/changed` | a manager operation completed in this process (install / remove / enable / bundle layer) |
+| `plugin-manager/install-state` (`applying`) | an installation has landed on disk |
+| `app-boot/config-reload` | a CLI or hand edit produced a new patch generation that the watcher reconciled |
+| **a loaded Host entry module's `mtime:size` moved** | **a `link:`-installed plugin was rebuilt** — this raises no event at all |
+
+The last row is the reason this plugin exists: the manager announces installs and the watcher announces patch generations, but rewriting a linked plugin's Host half in place announces nothing. Every 3 seconds the entry module of each Loader entry is stamped (`mtimeMs:size`); a moved stamp records a change. Only **entry modules** are watched — the browser half hot-reloads, so watching whole package directories would report changes a restart cannot improve.
+
+Any of them writes `<DSH_HOME>\dsh-plugin-restart\pending-restart.json` (timestamp, source, and **the writing process's pid**). The next completed reply reads it, so the card sits at the end of that reply:
+
+- It renders on the **timeline's last Turn only**, so scrolling history never repaints the same card.
+- **Later** only stamps `dismissedAt`; the next plugin change brings it back.
+- After a restart the new process sees a marker whose `pid` is not its own and clears it. (That pid is the whole "was this change honoured by a restart?" judgement; an in-process plugin reload does not clear it.)
+- `config-reload` within the first 4 seconds after boot is treated as the startup reconcile and ignored, so the app never opens with a prompt.
+- With `prompt: false` the Host does not even write the marker.
+
+The marker is one file; deleting it means "nothing is pending":
+
+```powershell
+Remove-Item "$env:USERPROFILE\.dsh\dsh-plugin-restart\pending-restart.json" -ErrorAction SilentlyContinue
+```
+
+### Button position (presets)
+
+| `position` | Seat | Where |
+|---|---|---|
+| `sidebar-footer` (default) | `sidebar.footer.action` | bottom left, beside Settings |
+| `session-header` | `conversation.session.header.utilities` | the Session title's right-hand utilities |
+| `composer-input` | `conversation.input.right` | the composer's compact controls, left of Send |
+| `composer-dock` | `conversation.composer.dock` | the ambient strip under the composer card |
+| `off` | — | no button; the end-of-reply prompt and this setting still work |
+
+The seat is a **runtime preference** and applies immediately: all four seats are registered at load time and the ones that are not selected render `null` (no layout), so changing the seat needs neither a re-register nor a page refresh.
+
+Two ways to change it, the first preferred:
+
+1. **Settings → Plugins → One-click DSH restart**, section *Restart button position*. One click saves to `<DSH_HOME>\dsh-plugin-restart\ui-settings.json`.
+2. The `position` value in the profile patch (the baseline; delete `ui-settings.json` to fall back to it).
 
 ## Configuration (optional, in the profile's `cordis.patch.yml`)
 
@@ -154,6 +201,9 @@ Uninstall: `& $dsh plugin --profile desktop remove dsh-plugin-restart`.
   name: dsh-plugin-restart
   config:
     enabled: true         # false disables the restart routes (they answer 409)
+    position: sidebar-footer # sidebar-footer / session-header / composer-input / composer-dock / off
+    prompt: true          # prompt at the end of the reply after a plugin change (false = no marker at all)
+    watchModules: true    # stamp loaded Host entry modules every 3s so a rebuilt linked plugin is noticed
     armDelayMs: 1200      # Host side: delay between the HTTP answer and the supervisor launch
     graceMs: 2000         # how long the app may exit on its own before its tree is force-killed
     dryRun: true          # return the plan only, never restart (troubleshooting)
@@ -165,7 +215,7 @@ Uninstall: `& $dsh plugin --profile desktop remove dsh-plugin-restart`.
 
 The trigger file is written **only** when the supervisor fails to launch (or when `relaunch: false`). Writing it on every request would make a resident tray a second authority racing the supervisor, and it could kill the app right after the supervisor brought it back.
 
-The config **uses no schema**: every value is clamped to its legal range inside the Host, so a hand-edited patch can only fall back to a default — it can never stop the Host from booting.
+The config **uses no schema**: every value is clamped to its legal range inside the Host, so a hand-edited patch can only fall back to a default — it can never stop the Host from booting (a misspelled `position` falls back to `sidebar-footer`; the button never disappears).
 
 ## HTTP surface (loopback only)
 
@@ -200,10 +250,10 @@ Prerequisites: **Windows 10/11 + Windows PowerShell 5.1** (`powershell.exe`; pws
 # Defaults to the local desktop install; on another machine, point $node at your node.exe
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 18 checks
-& $node tests\ui-render.mjs                                                  # 24 checks (stub-React render of the browser half)
+& $node tests\selfcheck.mjs                                                  # 23 checks
+& $node tests\ui-render.mjs                                                  # 38 checks (stub-React render of the browser half)
 & $node tests\ui-render.mjs --bundle <old client.js> --control               # negative control: the old bundle must fail
-& $node tests\routes.mjs                                                     # 16 checks
+& $node tests\routes.mjs                                                     # 32 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 18 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 checks
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 23 checks
@@ -211,14 +261,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 | Suite | Runtime | Checks | Covers |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 18 | manifest/patch/trust gate/tokenizer/config clamping/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
-| `tests/ui-render.mjs` | Node (`node:vm`) | 24 | the browser half **really rendered**: seat plus id/order, icon-only trigger, the sidebar-inset confirmation after a press, title and muted note as separate elements, panel width from the sidebar column variables, no rect maths (`--control` gives the negative control) |
-| `tests/routes.mjs` | Node | 16 | HTTP route contract (fake ctx + fake req/res, zero side effects) |
+| `tests/selfcheck.mjs` | Node | 23 | manifest/patch/trust gate/tokenizer/config clamping/**seat presets**/**UI preference precedence**/**pending-marker lifecycle**/**the change signals**/**rebuilt-module stamp detection**/plan contract/client review regressions/style tokens/locale parity/tray structure/hidden supervisor console/Electron main stopped first |
+| `tests/ui-render.mjs` | Node (`node:vm`) | 38 | the browser half **really rendered**: six seats, an unselected seat renders null, icon-only trigger, the sidebar-inset confirmation after a press, title and muted note as separate elements, panel width from the sidebar column variables, **the end-of-reply prompt (last Turn only)**, **Later** posting `/dismiss`, **the plugin-page settings section (five presets + switch, nothing on other pages)**, no rect maths (`--control` gives the negative control) |
+| `tests/routes.mjs` | Node | 32 | HTTP route contract (fake ctx + fake req/res, zero side effects): status/restart/`state`/`settings`/`dismiss`, seat writes and illegal-value fallback, the prompt switch, the pending marker and its dismissal |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | the supervisor really stops stand-ins, relaunches as-is, writes its result, refuses a missing exe, `-NoRelaunch`, **the app root stopped first in a parent/child tree** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | the real `buildRestartPlan` + `spawnSupervisor` path (hidden WMI start, supervisorPid, stand-ins) plus the `detached` negative control |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | tray process-control layer, trigger-file contract, BOM-less result, **the Electron main stopped first** |
 
-**110 checks total**: 58 across the three Node suites plus 52 across the three PowerShell suites.
+**145 checks total**: 93 across the three Node suites plus 52 across the three PowerShell suites.
 
 **Read this before running on another machine or in CI** (environment only, nothing to do with correctness):
 
@@ -228,7 +278,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 - All five suites are Windows-only (`Get-Process` / `Start-Process` / `taskkill` / WMI).
 - Keep `.ps1` files that contain non-ASCII literals as **UTF-8 with BOM** (currently only `tray/tray-host.ps1`).
 
-`routes.mjs` captures the two really-registered routes from a fake Host context and drives them with fake `req`/`res` objects. It covers the loopback/same-origin guard (403), the method guard (405), `enabled:false` (409), `dryRun` (200 + plan), arming (202), and a malformed body. The arming hop is replaced by a stub through the test-only `DSH_RESTART_NO_ARM=1`, so **no supervisor is ever launched and nothing is written to the real state directory**.
+`routes.mjs` captures the five really-registered routes from a fake Host context and drives them with fake `req`/`res` objects. It covers the loopback/same-origin guard (403), the method guard (405), `enabled:false` (409), `dryRun` (200 + plan), arming (202), a malformed body, and the `/state` + `/settings` + `/dismiss` contracts (seat write, illegal-value fallback, prompt switch, pending marker, dismissal). The arming hop is replaced by a stub through the test-only `DSH_RESTART_NO_ARM=1`, so **no supervisor is ever launched and nothing is written to the real state directory**.
 
 `selfcheck.mjs` contains a **client review-regression block** that turns every finding from two rounds of review into an assertion (styles must carry `data-plugin`, arming must require `scheduled === true`, a failure must not arm, requests must be abortable, the panel must be CSS-anchored rather than rect-measured, no `stopPropagation`, an outside click must not dismiss a busy panel, a11y and locale wiring), so none of them can regress silently. The "CSS-anchored" assertion was **restated on 2026-10-08**: the confirmation moved from a floating card in the bottom-left corner of the viewport to an inset of the sidebar column, so the assertion now reads "anchored to the trigger's own wrapper, width taken from the sidebar column variables, still no rect maths".
 
@@ -247,10 +297,15 @@ After one app restart you can also ask the **running Host** what it resolved, us
 ## Known limits
 
 - **A real restart cannot be self-tested by an agent** (the restart kills the process running the tests). The repository therefore ships non-destructive verification only: route contract, dry-run plan, trust gate, script syntax, client registration.
+- **Upgrading from 1.0.x to 1.1.0 needs one restart**: the browser half is replaced by client-hmr immediately (all four seats show up in the slot ledger), but the new routes (`/state`, `/settings`, `/dismiss`) and the change listeners live in the Host half, which only changes with a new process. Until that restart the new client cannot read `/state` and treats the prompt feature as offline — the button itself keeps working.
+- **The end-of-reply prompt lives in `conversation.chat.turnTail`** (DSH's native "before a completed Turn's action row" seat). It filters by **the timeline's last Turn**, so history is never repainted; if a future DSH major renames that seat or the `useChat` standard prop, the prompt degrades — a missing `useChat` is treated as "always the last Turn", which safely over-shows instead of silently disappearing.
+- **"The plugin set changed" comes from three DSH events plus one file stamp** (`plugin-manager/changed`, `plugin-manager/install-state` at `applying`, `app-boot/config-reload`, and the `mtimeMs:size` of every loaded Host entry module, re-stamped every 3 seconds). They report that a change happened, not that a restart is mandatory — the manager itself distinguishes `restart-required` from `applied`. That is why the copy says "restart to apply" rather than "you must restart"; you decide. The stamp can over-report (a build tool rewriting the entry file repeatedly), and the cost is one dismissible card.
+- All four trigger seats are registered at load time and the unselected ones render `null`. That makes a seat change pure data, at the cost of four inert `dsh-restart` occupants in the slot ledger (none of them has layout).
+- In the Session-header and composer seats the confirmation is an **absolutely positioned popover** that overlays the conversation. If a future DSH version adds `overflow: hidden` to those rows, the panel would be clipped there (the sidebar seat is sized to the column and unaffected); switch back to `sidebar-footer` in that case.
 - `dsh.client.inject` declares `@deepseek-ai/dsh-client-ui-conversation` to ensure the UI package that provides the sidebar-footer slot loads before this plugin; `client.js` itself only requires `react`.
 - The UI styles depend on DSH's internal design tokens (`--dsw-alias-*`) so they follow the host theme. Those names are an internal host contract and may be renamed across major versions.
-- The confirmation panel's **width** comes from the host's sidebar column variable `--dsh-windows-sidebar-width` (published by the frame on the grid column) and `--dsh-sidebar-inline-padding` (defined by the sidebar root), both with fallbacks (`240px` / `12px`): when neither resolves the panel degrades to 216px rather than collapsing to zero. Those two names are host-internal contracts, exactly like `--dsw-alias-*`.
-- Horizontal alignment relies on the plugin's `order: 10` being the lowest in the footer action row: it registers first in `footerActions`, so `left: 0` equals the sidebar's content edge. If another plugin ever takes a smaller `order`, the panel merely shifts right by that button's width — it never leaves the sidebar.
+- The **sidebar-seat** panel's width comes from the host's sidebar column variable `--dsh-windows-sidebar-width` (published by the frame on the grid column) and `--dsh-sidebar-inline-padding` (defined by the sidebar root), both with fallbacks (`240px` / `12px`): when neither resolves the panel degrades to 216px rather than collapsing to zero. The header and composer seats use a fixed 280px card, because those rows have no column width to inherit. Those two names are host-internal contracts, exactly like `--dsw-alias-*`.
+- Horizontal alignment of the **sidebar seat** relies on the plugin's `order: 10` being the lowest in the footer action row: it registers first in `footerActions`, so `left: 0` equals the sidebar's content edge. If another plugin ever takes a smaller `order`, the panel merely shifts right by that button's width — it never leaves the sidebar.
 - The generated client bundle is unminified; this is a development/personal-use package.
 - Force-killing the process tree interrupts running tasks; session logs are persisted per event, so a normal restart can still `--resume`.
 - If the button disappears after a DSH upgrade, run `install_bundle` once more.

@@ -7,7 +7,9 @@
 
 插件迭代后，**点一下界面上的「重启 DSH」按钮**，整个 DeepSeek Harness 桌面应用（Electron 外壳 + Host）会退出并自动重新启动，让刚重建的插件包、组合（bundle）、preset 立即生效。
 
-- **左下角头像/设置那一排**的图标按钮（`sidebar.footer.action`，`order: 10`）：纯图标、无文字，悬停有提示，点击后在**侧栏内**（不是窗口角落）弹出确认面板——一句标题 `重启 DSH`、一条弱化的范围备注 `（应用与 Host）`，加 取消 / 立即重启。
+- **按钮位置可配置**（`position`，5 个预设）：侧栏页脚（默认）、会话标题栏、输入框工具行、输入框下方、不显示按钮。位置既写在 profile patch 里，也能在**「设置 → 插件 → 一键重启 DSH」这一页**直接改，改完即时生效、不需要重启。
+- **回复末尾的自动提示**：Host 收到「插件/组合已变更」的信号后记一个待重启标记；下一轮回复结束时，提示卡直接出现在**这条回复的末尾**（`conversation.chat.turnTail`——DSH 给「完成的一轮回复、动作行之前」的原生席位），一句标题、两个按钮：`稍后` / `立即重启`。它只出现在**最新一轮**上，不会把整段历史都刷一遍；`稍后` 只收起本次，下次插件变更会再出现。
+- 默认位置是**左下角头像/设置那一排**的图标按钮（`sidebar.footer.action`，`order: 10`）：纯图标、无文字，悬停有提示，点击后在**侧栏内**（不是窗口角落）弹出确认面板——一句标题 `重启 DSH`、一条弱化的范围备注 `（应用与 Host）`，加 取消 / 立即重启。
 - 可选：`tray/tray-host.ps1` 提供 Windows 托盘入口「重启 DSH」，不依赖界面也能重启/拉起。
 
 本包**不修改 DSH 源码、不需要 fork**：它是一个标准 profile bundle（`dsh.bundle.patch` + `dsh.client`），装进当前 profile 即可。
@@ -141,10 +143,55 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/resta
 
 ## 使用
 
-1. 重建你的插件（`pnpm build` 等）。
-2. 点左下角的「重启 DSH」图标 →「立即重启」。
+1. 重建你的插件（`pnpm build` 等），或从「设置 → 插件」安装/更新一个插件包。
+2. 下一轮回复结束时，回复末尾会出现提示卡：**插件已更新，重启后生效** → `立即重启`（或 `稍后`）。
+   - 也可以在配置的位置点图标按钮 → 确认面板 → `立即重启`。
 3. 应用自动退出并回来，页面重连后可继续同一会话。
 4. 若没回来：看 `%USERPROFILE%\.dsh\dsh-plugin-restart\restart.log` 与 `restart-result.json`，两者都记录了守护脚本每一步。
+
+### 回复末尾的自动提示（什么时候出现）
+
+Host 只认四种信号，全部来自 DSH 自己发布的事件或已加载模块的实际时间戳，不猜文件内容：
+
+| 信号 | 含义 |
+|---|---|
+| `plugin-manager/changed` | 本进程里完成了一次管理器操作（装/卸/启停/组合层变化） |
+| `plugin-manager/install-state`（`applying`） | 一次安装已经落到文件上 |
+| `app-boot/config-reload` | CLI 或手改 patch 后，watcher 把新的 patch 代次并对进 Loader 树 |
+| **已加载 Host 入口模块的 `mtime:size` 变了** | **重建了某个 `link:` 安装的插件**——这类改动不产生任何事件，只改磁盘 |
+
+最后一条就是本插件存在的理由：管理器会广播安装，watcher 会广播 patch，但**原地重写一个 linked 插件的 Host 半边什么都不广播**。所以每 3 秒给每个 Loader 条目的入口模块盖一次戳（`mtimeMs:size`），戳变了就记一笔。只盯**入口模块**、不盯整个包目录：浏览器半边是热替换的，盯目录只会报出「重启也修不好」的变化。
+
+命中任一信号 → 写 `<DSH_HOME>\dsh-plugin-restart\pending-restart.json`（记录时间、来源、**写入进程的 pid**）。提示卡在下一轮对话结束时读到它，于是出现在**这条回复的末尾**：
+
+- 只出现在**时间线的最后一轮**：往上的历史轮次不会被反复刷出同一张卡。
+- `稍后` 只是给标记补一个 `dismissedAt`，**下次插件变更会重新出现**。
+- 重启成功后，新进程启动时会发现标记的 pid 不是自己 → 自动清掉（`pid` 就是「这次改动有没有被重启兑现」的判据；同进程内的插件重载不会误清）。
+- 启动后 4 秒内的 `config-reload` 视为开机对账、不记标记，避免一打开应用就弹提示。
+- `prompt: false` 时 Host 连标记都不写。
+
+标记只是一个文件，删掉即等于「没有待重启的改动」：
+
+```powershell
+Remove-Item "$env:USERPROFILE\.dsh\dsh-plugin-restart\pending-restart.json" -ErrorAction SilentlyContinue
+```
+
+### 按钮位置（预设）
+
+| `position` | 落在哪个席位 | 说明 |
+|---|---|---|
+| `sidebar-footer`（默认） | `sidebar.footer.action` | 左下角、设置按钮旁 |
+| `session-header` | `conversation.session.header.utilities` | 会话标题右侧工具区 |
+| `composer-input` | `conversation.input.right` | 发送按钮左侧的紧凑控制区 |
+| `composer-dock` | `conversation.composer.dock` | 输入框卡片下方的环境条目区 |
+| `off` | — | 不显示按钮；回复末尾的提示与本页设置仍可用 |
+
+座位是**运行时偏好**，改完即时生效：四个席位在加载时全部注册，未选中的席位渲染 `null`（没有布局），所以换位置不需要重新注册、更不需要刷新页面。
+
+改法有两条，优先用第一条：
+
+1. **「设置 → 插件 → 一键重启 DSH」页面底部**的「重启按钮位置」，点一下即保存到 `<DSH_HOME>\dsh-plugin-restart\ui-settings.json`。
+2. profile patch 的 `position`（作为基线；删掉 `ui-settings.json` 就回到 patch 的值）。
 
 ## 配置（profile 的 `cordis.patch.yml`，可选）
 
@@ -153,6 +200,9 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/resta
   name: dsh-plugin-restart
   config:
     enabled: true         # 关闭重启路由（返回 409）
+    position: sidebar-footer # 按钮位置：sidebar-footer / session-header / composer-input / composer-dock / off
+    prompt: true          # 插件变更后在回复末尾提示重启（false = 不记待重启标记）
+    watchModules: true    # 每 3 秒给已加载的 Host 入口模块盖戳，重建 linked 插件也能被发现
     armDelayMs: 1200      # Host 侧：HTTP 应答与守护脚本启动之间的延迟
     graceMs: 2000         # 等待应用自行退出的时间，超时后强杀进程树
     dryRun: true          # 只返回计划、绝不真正重启（排障用）
@@ -164,18 +214,26 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/resta
 
 触发文件只在**守护脚本启动失败**（或 `relaunch: false`）时写出：如果每条请求都写，常驻托盘就成了与守护脚本赛跑的第二权威，可能在应用刚被拉起时又把它杀掉。
 
-config **不使用 schema**，所有值在 Host 内被钳制到合法区间：手写 patch 写错也只会退化为默认值，不会让 Host 起不来。
+config **不使用 schema**，所有值在 Host 内被钳制到合法区间：手写 patch 写错也只会退化为默认值，不会让 Host 起不来（`position` 拼错 → 回落到 `sidebar-footer`，按钮不会消失）。
 
 ## HTTP 面（loopback-only）
 
-两个路由都只接受 `127.0.0.1`/`::1` + 同源（`Origin` 与 `Host` 一致，`Sec-Fetch-Site` 非 cross-site）的 `POST`：
+五个路由都只接受 `127.0.0.1`/`::1` + 同源（`Origin` 与 `Host` 一致，`Sec-Fetch-Site` 非 cross-site）的 `POST`：
 
 ```powershell
 # 查看当前重启计划（不产生副作用）
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/status -ContentType application/json -Body '{}'
 # 演练：只返回计划，不重启
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/restart -ContentType application/json -Body '{"dryRun":true}'
+# 便宜的状态读：按钮位置 + 提示开关 + 待重启标记（不扫进程）
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/state -ContentType application/json -Body '{}'
+# 改位置 / 关提示
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/settings -ContentType application/json -Body '{"position":"session-header"}'
+# 收起本次提示（等同界面上的「稍后」）
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19387/api/dsh-restart/dismiss -ContentType application/json -Body '{}'
 ```
+
+`/state`、`/settings`、`/dismiss` 的回答形状一致：`{ settings: { position, prompt, updatedAt, source }, pending, enabled, dryRun, relaunch, positions }`。
 
 ## 托盘（可选）
 
@@ -199,10 +257,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell
 # 默认走本机安装目录；其它机器请把 $node 改成本机 node.exe 路径
 $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
 
-& $node tests\selfcheck.mjs                                                  # 18 项
-& $node tests\ui-render.mjs                                                  # 24 项（桩 React 真渲染浏览器半）
+& $node tests\selfcheck.mjs                                                  # 23 项
+& $node tests\ui-render.mjs                                                  # 38 项（桩 React 真渲染浏览器半）
 & $node tests\ui-render.mjs --bundle <旧版 client.js> --control              # 反向对照：旧版必须失败
-& $node tests\routes.mjs                                                     # 16 项
+& $node tests\routes.mjs                                                     # 32 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\supervisor-e2e.ps1  # 18 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\host-arm-e2e.ps1    # 11 项
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 23 项
@@ -210,14 +268,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 
 | 套件 | 运行时 | 条数 | 覆盖 |
 |---|---|---|---|
-| `tests/selfcheck.mjs` | Node | 18 | manifest/patch/信任门/tokenizer/配置钳制/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
-| `tests/ui-render.mjs` | Node (`node:vm`) | 24 | 浏览器半**真渲染**：席位与 id/order、纯图标触发、按下后侧栏内嵌面板、标题与弱化备注分离、面板宽度取自侧栏列变量、无 rect 计算（配 `--control` 反向对照） |
-| `tests/routes.mjs` | Node | 16 | HTTP 路由契约（假 ctx + 假 req/res，0 副作用） |
+| `tests/selfcheck.mjs` | Node | 23 | manifest/patch/信任门/tokenizer/配置钳制/**座位预设归一化**/**UI 偏好优先级**/**待重启标记生命周期**/**三种变更信号接线**/**重建模块的戳变化检测**/计划契约/客户端审查结论/样式 token/locale 字典同步/托盘结构/守护进程控制台隐藏/先杀 Electron 主进程 |
+| `tests/ui-render.mjs` | Node (`node:vm`) | 38 | 浏览器半**真渲染**：六个席位、未选中席位渲染 null、纯图标触发、按下后侧栏内嵌面板、标题与弱化备注分离、面板宽度取自侧栏列变量、**回复末尾提示卡（仅最后一轮）**、`稍后` 走后端收起、**插件页设置区（5 个预设 + 开关 + 其它插件页不渲染）**、无 rect 计算（配 `--control` 反向对照） |
+| `tests/routes.mjs` | Node | 32 | HTTP 路由契约（假 ctx + 假 req/res，0 副作用）：状态/重启/`state`/`settings`/`dismiss`、座位写入与非法值回落、提示开关、待重启标记与收起 |
 | `tests/supervisor-e2e.ps1` | PowerShell 5.1 | 18 | 守护脚本真杀替身进程、按原样重启、写结果、防误杀守卫、no-launch 开关、**父+子树形下的「先杀应用根」顺序** |
 | `tests/host-arm-e2e.ps1` | PowerShell 5.1 | 11 | Host 真实 `buildRestartPlan` + `spawnSupervisor` 全链路（WMI 隐藏启动、supervisorPid、替身进程）+ `detached` 反例对照 |
 | `tests/tray-selfcheck.ps1` | PowerShell 5.1 | 23 | 托盘进程控制层 + 触发文件契约 + 无 BOM 结果 + **先杀 Electron 主进程** |
 
-合计 **110 项**断言：3 个 Node 套件共 58 项 + 3 个 PowerShell 套件共 52 项。
+合计 **145 项**断言：3 个 Node 套件共 93 项 + 3 个 PowerShell 套件共 52 项。
 
 **换机器 / 上 CI 前必读**（与代码正确性无关，只与运行环境有关）：
 
@@ -227,11 +285,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 - 五个套件全部 Windows-only（用到 `Get-Process` / `Start-Process` / `taskkill` / WMI）。
 - 含非 ASCII 字面量的 `.ps1` 请保持 **UTF-8 with BOM**（当前只有 `tray/tray-host.ps1`）。
 
-`routes.mjs` 用假 Host 上下文捕获真实注册的两个路由，再用假 `req/res` 驱动它们，覆盖：loopback/同源守卫（403）、方法守卫（405）、`enabled:false`（409）、`dryRun`（200 + 计划）、武装（202）与畸形 body 兜底；武装那一跳由测试专用开关 `DSH_RESTART_NO_ARM=1` 换成桩，**不会启动任何守护进程、也不会写出到真实状态目录**。
+`routes.mjs` 用假 Host 上下文捕获真实注册的五个路由，再用假 `req/res` 驱动它们，覆盖：loopback/同源守卫（403）、方法守卫（405）、`enabled:false`（409）、`dryRun`（200 + 计划）、武装（202）与畸形 body 兜底；`/state`、`/settings`、`/dismiss` 覆盖座位写入、非法座位回落、提示开关、待重启标记与「稍后」；武装那一跳由测试专用开关 `DSH_RESTART_NO_ARM=1` 换成桩，**不会启动任何守护进程、也不会写出到真实状态目录**。
 
-`selfcheck.mjs` 里有一条**客户端审查结论回归**：把两轮代码审查发现的每一条（样式必须带 `data-plugin`、武装必须要求 `scheduled === true`、失败不得置 armed、请求必须可中止、弹层必须 CSS 锚定而非 rect 计算、不得 `stopPropagation`、busy 期间不得被外部点击关掉、a11y 与 locale 接线）固化成断言，防止回退。其中「弹层必须 CSS 锚定」一条在 2026-10-08 被**改写成新结论**：确认面板从「视口左下角的浮窗」改为「侧栏列内嵌面板」，断言随之变为「锚定在触发按钮自己的 wrapper 上、宽度取自侧栏列变量、且仍然不做 rect 计算」。
+`selfcheck.mjs` 里有一条**客户端审查结论回归**：把两轮代码审查发现的每一条（样式必须带 `data-plugin`、武装必须要求 `scheduled === true`、失败不得置 armed、请求必须可中止、弹层必须 CSS 锚定而非 rect 计算、不得 `stopPropagation`、busy 期间不得被外部点击关掉、a11y 与 locale 接线）固化成断言，防止回退。其中「弹层必须 CSS 锚定」一条在 2026-10-08 被**改写成新结论**：确认面板从「视口左下角的浮窗」改为「侧栏列内嵌面板」，断言随之变为「锚定在触发按钮自己的 wrapper 上、宽度取自侧栏列变量、且仍然不做 rect 计算」。2026-10-19 加入「座位预设」后，这条断言进一步变成「每个座位都有自己的锚点规则（页脚向上贴列、标题栏向下、输入框向上），页脚那条仍取侧栏列变量」。
 
-`ui-render.mjs` 是同一批结论的**行为版**：它把 `client.js` 装进 `node:vm`（桩 React + 桩 `slots`/`locale`），真的把注册进 `sidebar.footer.action` 的组件渲染出来——先渲染闭合态（纯图标、无文字、`aria-label` 完整），再调用触发按钮的 `onClick` 渲染展开态，然后断言面板落在自己的席位上、标题与备注是两个不同元素、备注不是标题也不是粗体、面板宽度来自 `--dsh-windows-sidebar-width` 与 `--dsh-sidebar-inline-padding`。它支持 `--bundle <旧版> --control`：旧 bundle 上必须**恰好**在新期望上失败（实测 10 项），否则说明这套断言恒真、已经失去鉴别力。
+`ui-render.mjs` 是同一批结论的**行为版**：它把 `client.js` 装进 `node:vm`（桩 React + 桩 `slots`/`locale`/`fetch`），逐个渲染注册出去的组件——先渲染闭合态（纯图标、无文字、`aria-label` 完整），再调用触发按钮的 `onClick` 渲染展开态，然后断言面板落在自己的席位上、标题与备注是两个不同元素、备注不是标题也不是粗体、面板宽度来自 `--dsh-windows-sidebar-width` 与 `--dsh-sidebar-inline-padding`；再用一份「有待重启标记」的桩 `fetch` 渲染回复末尾的提示卡（最后一轮出现、历史轮不出、`稍后` 打到 `/dismiss`），最后渲染插件页设置区（其它插件页面渲染 null、本包页面给出 5 个预设与开关）。它支持 `--bundle <旧版> --control`：旧 bundle 上必须**恰好**在新期望上失败（2026-10-19 实测 9 项），否则说明这套断言恒真、已经失去鉴别力。
 
 其中最有价值的一项是**计划契约自检**：它解析 `lib/restart-supervisor.ps1` 的 `param()` 块里脚本真正声明的参数，再断言 `buildRestartPlan()` 都产出、且 `spawnSupervisor` 会把 `-Exe/-GraceMs/-StateDir/-LogPath/-ResultPath` 逐个作为 argv 传下去——开发期就挡住「一边写 `targetPid`、另一边读 `parentPid`」这类只在重启瞬间才炸的字段漂移（本包第一版正是栽在这里）。
 
@@ -246,10 +304,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\tray-selfcheck.ps1  # 
 ## 已知边界
 
 - **真实重启不可由代理自测**（重启会杀掉执行测试的进程）。因此仓库内只做非破坏性验证：路由契约、dry-run 计划、信任门、脚本语法、客户端注册。
+- **从 1.0.x 升级到 1.1.0 后需要重启一次**：浏览器半边会随 client-hmr 立刻换成新代码（四个席位立刻出现在 Slot 账本里），但新路由（`/state`、`/settings`、`/dismiss`）与事件监听在 Host 半边，必须换进程才生效。重启前新客户端会读不到 `/state`、把提示功能标成离线——按钮仍然可用，不会出错。
+- **回复末尾提示的座位是 `conversation.chat.turnTail`**（DSH 的原生位置：「一轮完成、动作行之前」）。它按**时间线最后一轮**过滤，所以历史轮不会重复弹；换 DSH 大版本时若该席位或 `useChat` 的标准 props 改名，提示会退化——`useChat` 缺失时按「始终是最新一轮」处理，宁可在历史轮里安全地多显示，也不静默消失。
+- **「插件变更」的三个事件信号 + 一个文件戳信号**（`plugin-manager/changed`、`plugin-manager/install-state` 的 `applying`、`app-boot/config-reload`，以及每 3 秒给已加载 Host 入口模块盖的 `mtimeMs:size`）。事件描述「变更有发生」，不保证「必须重启」——DSH 的管理器自己还会区分 `restart-required` / `applied`。因此提示的措辞是「重启后生效」，而不是「必须重启」；是否需要重启由你判断，点不点都能继续用。模块戳会有误报（例如构建工具连续重写入口文件），代价只是一张可收起的提示卡。
+- 四个触发席位在加载时全部注册、未选中的渲染 `null`。这样换位置是纯数据更新；代价是 Slot 账本里能看到四个 `dsh-restart` 占位（每个都没有布局）。
+- 面板在标题栏/输入框这两个席位是**绝对定位的浮层**，会覆盖到会话内容上；如果将来 DSH 给这些行加了 `overflow: hidden`，这两个座位的面板会被裁切（页脚座位是贴侧栏列宽的，不受影响）。遇到这种情况换回 `sidebar-footer` 即可。
 - `dsh.client.inject` 声明了 `@deepseek-ai/dsh-client-ui-conversation`，用于保证侧边栏页脚插槽所在的 UI 包先于本插件加载；`client.js` 本身只 `require('react')`。
 - 界面样式依赖 DSH 内部设计 token（`--dsw-alias-*`），因此跟随宿主主题；这些名字属于宿主内部契约，跨大版本可能改名。
-- 确认面板的**宽度**取自宿主的侧栏列变量 `--dsh-windows-sidebar-width`（由框架在网格列上发布）与侧栏根定义的 `--dsh-sidebar-inline-padding`，两者都带兜底值（`240px` / `12px`）：变量缺失时面板退化为 216px 宽，不会塌成 0。这两个名字与 `--dsw-alias-*` 同属宿主内部契约，改名时同样只需跟随调整。
-- 面板横向对齐依赖「本插件的 `order: 10` 是页脚动作排里最小的一个」——它注册在 `footerActions` 这一整行 flex 的首位，因此 `left: 0` 就等于侧栏内容列的左缘。若将来有别的插件用更小的 `order` 挤到前面，面板只会整体右移该按钮的宽度，不会错位到侧栏之外。
+- **页脚座位**的确认面板宽度取自宿主的侧栏列变量 `--dsh-windows-sidebar-width`（由框架在网格列上发布）与侧栏根定义的 `--dsh-sidebar-inline-padding`，两者都带兜底值（`240px` / `12px`）：变量缺失时面板退化为 216px 宽，不会塌成 0。标题栏/输入框座位改用固定 280px 的卡片（这些行没有可继承的列宽）。这些名字与 `--dsw-alias-*` 同属宿主内部契约，改名时同样只需跟随调整。
+- **页脚座位**的面板横向对齐依赖「本插件的 `order: 10` 是页脚动作排里最小的一个」——它注册在 `footerActions` 这一整行 flex 的首位，因此 `left: 0` 就等于侧栏内容列的左缘。若将来有别的插件用更小的 `order` 挤到前面，面板只会整体右移该按钮的宽度，不会错位到侧栏之外。
 - 生成的客户端 bundle 未压缩，仅为本机开发/自用。
 - 强制终止进程树会打断正在运行的任务；会话日志按事件持久化，正常重启后仍可 `--resume`。
 - 升级 DSH 后若按钮消失，重新 `install_bundle` 一次即可。
